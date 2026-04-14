@@ -1,0 +1,29 @@
+{
+  "db": {
+    "url": "DATABASE_URL",
+    "conn": {
+      "max": "DB_MAX_CONNS",
+      "min": "DB_MIN_CONNS",
+      "idleSecs": "DB_MAX_CONN_IDLE_SECS",
+      "lifetimeSecs": "DB_MAX_CONN_LIFETIME_SECS",
+      "acquireTimeoutSecs": "DB_ACQUIRE_TIMEOUT_SECS"
+    }
+  },
+  "redis": {
+    "addr": "REDIS_ADDR",
+    "cacheTtlSeconds": "CACHE_TTL_SECONDS"
+  },
+  "kafka": {
+    "brokers": "KAFKA_BROKERS",
+    "topic": "KAFKA_TOPIC",
+    "groupId": "KAFKA_GROUP_ID"
+  },
+  "application": {
+    "port": "HTTP_PORT",
+    "metricsPort": "METRICS_PORT",
+    "admin": {
+      "enable": "ADMIN_MODE",
+      "token": "ADMIN_TOKEN"
+    }
+  }
+}

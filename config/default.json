@@ -1,0 +1,25 @@
+{
+  "db": {
+    "conn": {
+      "max": 20,
+      "min": 2,
+      "idleSecs": 300,
+      "lifetimeSecs": 3600,
+      "acquireTimeoutSecs": 2
+    }
+  },
+  "redis": {
+    "cacheTtlSeconds": 300
+  },
+  "kafka": {
+    "topic": "authz.permission-events",
+    "groupId": "authz-worker"
+  },
+  "application": {
+    "port": 3000,
+    "metricsPort": 3001,
+    "admin": {
+      "enable": false
+    }
+  }
+}

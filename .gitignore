@@ -1,0 +1,6 @@
+/worker
+/worker.exe
+/api
+/api.exe
+.env*
+!.env.dist

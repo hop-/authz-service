@@ -1,0 +1,162 @@
+name: authz
+
+# Default logging configuration
+x-logging:
+  &default-logging
+  driver: json-file
+  options:
+    max-size: 5m
+    max-file: 3
+
+# Service definitions
+
+services:
+  db:
+    image: postgres:16-alpine
+    restart: always
+    logging: *default-logging
+    ports:
+      - 5432:5432
+    environment:
+      PGDATA: /var/lib/postgresql/pgdata-dev
+      POSTGRES_DB: authz
+      POSTGRES_USER: authz
+      POSTGRES_PASSWORD: authz
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready", "-d", "localhost"]
+      interval: 10s
+      timeout: 10s
+      retries: 20
+      start_period: 10s
+    volumes:
+      - db-data:/var/lib/postgresql/data
+
+  kafka:
+    image: confluentinc/cp-kafka:7.9.1
+    restart: always
+    logging: *default-logging
+    ports:
+      - 9092:9092
+    environment:
+      # Kafka basic configuration
+      CLUSTER_ID: kafka
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: controller,broker
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_CONTROLLER_QUORUM_VOTERS: "1@kafka:9093"
+      # Kafka listener configuration
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: "PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT,CONTROLLER:PLAINTEXT"
+      KAFKA_LISTENERS: "PLAINTEXT://0.0.0.0:9094,PLAINTEXT_HOST://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093"
+      KAFKA_ADVERTISED_LISTENERS: "PLAINTEXT://kafka:9094,PLAINTEXT_HOST://localhost:9092"
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      # Kafka other configuration
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_LOG4J_ROOT_LOGLEVEL: INFO
+      KAFKA_LOG4J_LOGGERS: "kafka.controller=ERROR,kafka.producer.async.DefaultEventHandler=ERROR,state.change.logger=ERROR"
+      CONFLUENT_SUPPORT_METRICS_ENABLE: "false"
+    healthcheck:
+      test: nc -z localhost 9092
+      interval: 10s
+      timeout: 10s
+      retries: 20
+      start_period: 10s
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+
+  kafbat:
+    logging: *default-logging
+    image: ghcr.io/kafbat/kafka-ui:latest
+    restart: always
+    ports:
+      - 9080:8080
+    environment:
+      KAFKA_CLUSTERS_0_NAME: 'kafka'
+      KAFKA_CLUSTERS_0_BOOTSTRAP_SERVERS: 'kafka:9094'
+    depends_on:
+      kafka:
+        condition: service_healthy
+
+  redis:
+    image: redis:alpine
+    restart: always
+    logging: *default-logging
+    ports:
+      - 6379:6379
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 10s
+      retries: 20
+      start_period: 5s
+    volumes:
+      - redis-data:/data
+    command: [
+      "redis-server",
+      # Uncomment the line below to set a password
+      # "--requirepass", "mysecretpassword",
+      "--appendonly", "yes"
+    ]
+
+  redisinsight:
+    image: redis/redisinsight:latest
+    restart: always
+    logging: *default-logging
+    container_name: redisinsight
+    ports:
+      - "9081:5540"
+    environment:
+      - RI_APP_PORT=5540
+    volumes:
+      - redisinsight-data:/data
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: api
+    env_file:
+      - path: .env
+        required: false
+      - path: .env.api
+        required: false
+    ports:
+      - 3000:3000
+    depends_on:
+      db:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: worker
+    env_file:
+      - path: .env
+        required: false
+      - path: .env.worker
+        required: false
+    depends_on:
+      db:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+volumes:
+  db-data:
+    driver: local
+  kafka-data:
+    driver: local
+  redis-data:
+    driver: local
+  redisinsight-data:
+    driver: local
