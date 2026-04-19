@@ -12,6 +12,7 @@ RUN CGO_ENABLED=0 GOOS=linux go build -o /worker ./cmd/worker
 FROM gcr.io/distroless/static AS api
 COPY --from=builder /app/config /config
 COPY --from=builder /api /api
+EXPOSE 3000
 ENTRYPOINT ["/api"]
 
 # --- Worker image ---

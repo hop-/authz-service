@@ -7,6 +7,7 @@ import (
 	"authz-service/internal/resolver"
 
 	"github.com/go-chi/chi/v5"
+	httpSwagger "github.com/swaggo/http-swagger"
 )
 
 func NewRouter(res *resolver.Resolver, adminHandler *AdminHandler, cfg *config.Config) http.Handler {
@@ -21,6 +22,9 @@ func NewRouter(res *resolver.Resolver, adminHandler *AdminHandler, cfg *config.C
 
 	r.Get("/healthz", handleLiveness)
 	r.Get("/readyz", handleReadiness)
+
+	r.Get("/swagger/*", httpSwagger.WrapHandler)
+
 	return r
 }
 

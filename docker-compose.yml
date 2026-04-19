@@ -125,6 +125,8 @@ services:
         required: false
     ports:
       - 3000:3000
+    labels:
+      - "authz.swagger=http://localhost:3000/swagger/index.html"
     depends_on:
       db:
         condition: service_healthy

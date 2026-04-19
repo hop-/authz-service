@@ -26,6 +26,15 @@ func NewAdminHandler(q *db.Queries, reg *registry.Registry, p *producer.Producer
 
 // --- Action registry ---
 
+// @Summary List all registered actions
+// @Description Return all registered permission (action, resource_type) pairs.
+// @Tags admin-actions
+// @Produce json
+// @Security AdminToken
+// @Success 200 {array} model.Permission
+// @Failure 401 {object} model.ErrorResponse
+// @Failure 500 {object} model.ErrorResponse
+// @Router /admin/v1/actions [get]
 func (h *AdminHandler) ListActions(w http.ResponseWriter, r *http.Request) {
 	perms, err := h.db.ListAllPermissions(r.Context())
 	if err != nil {
@@ -38,6 +47,18 @@ func (h *AdminHandler) ListActions(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, perms)
 }
 
+// @Summary Register a new action
+// @Description Create a new permission entry (action + resource_type). Async — returns 202.
+// @Tags admin-actions
+// @Accept json
+// @Security AdminToken
+// @Param body body object true "Action definition" SchemaExample({"action":"read","resource_type":"project","description":"Read access"})
+// @Success 202 "Accepted"
+// @Failure 400 {object} model.ErrorResponse
+// @Failure 401 {object} model.ErrorResponse
+// @Failure 409 {object} model.ErrorResponse
+// @Failure 500 {object} model.ErrorResponse
+// @Router /admin/v1/actions [post]
 func (h *AdminHandler) CreateAction(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		Action       string `json:"action"`
@@ -72,6 +93,17 @@ func (h *AdminHandler) CreateAction(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusAccepted)
 }
 
+// @Summary Remove an action
+// @Description Delete a registered permission. Async — returns 202.
+// @Tags admin-actions
+// @Security AdminToken
+// @Param action path string true "Action name"
+// @Param resource_type path string true "Resource type"
+// @Success 202 "Accepted"
+// @Failure 401 {object} model.ErrorResponse
+// @Failure 404 {object} model.ErrorResponse
+// @Failure 500 {object} model.ErrorResponse
+// @Router /admin/v1/actions/{action}/{resource_type} [delete]
 func (h *AdminHandler) DeleteAction(w http.ResponseWriter, r *http.Request) {
 	action := chi.URLParam(r, "action")
 	resourceType := chi.URLParam(r, "resource_type")
@@ -96,6 +128,15 @@ func (h *AdminHandler) DeleteAction(w http.ResponseWriter, r *http.Request) {
 
 // --- Role management ---
 
+// @Summary List all roles
+// @Description Return all registered roles.
+// @Tags admin-roles
+// @Produce json
+// @Security AdminToken
+// @Success 200 {array} model.Role
+// @Failure 401 {object} model.ErrorResponse
+// @Failure 500 {object} model.ErrorResponse
+// @Router /admin/v1/roles [get]
 func (h *AdminHandler) ListRoles(w http.ResponseWriter, r *http.Request) {
 	roles, err := h.db.ListAllRoles(r.Context())
 	if err != nil {
@@ -108,6 +149,18 @@ func (h *AdminHandler) ListRoles(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, roles)
 }
 
+// @Summary Create a role
+// @Description Create a new role. Async — returns 202.
+// @Tags admin-roles
+// @Accept json
+// @Security AdminToken
+// @Param body body object true "Role definition" SchemaExample({"name":"editor","description":"Can edit resources"})
+// @Success 202 "Accepted"
+// @Failure 400 {object} model.ErrorResponse
+// @Failure 401 {object} model.ErrorResponse
+// @Failure 409 {object} model.ErrorResponse
+// @Failure 500 {object} model.ErrorResponse
+// @Router /admin/v1/roles [post]
 func (h *AdminHandler) CreateRole(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		Name        string `json:"name"`
@@ -140,6 +193,17 @@ func (h *AdminHandler) CreateRole(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusAccepted)
 }
 
+// @Summary List role permissions
+// @Description Return all permissions assigned to a role.
+// @Tags admin-roles
+// @Produce json
+// @Security AdminToken
+// @Param name path string true "Role name"
+// @Success 200 {array} model.Permission
+// @Failure 401 {object} model.ErrorResponse
+// @Failure 404 {object} model.ErrorResponse
+// @Failure 500 {object} model.ErrorResponse
+// @Router /admin/v1/roles/{name}/permissions [get]
 func (h *AdminHandler) ListRolePermissions(w http.ResponseWriter, r *http.Request) {
 	name := chi.URLParam(r, "name")
 
@@ -160,6 +224,19 @@ func (h *AdminHandler) ListRolePermissions(w http.ResponseWriter, r *http.Reques
 	writeJSON(w, http.StatusOK, perms)
 }
 
+// @Summary Assign permission to role
+// @Description Add a permission to a role. Async — returns 202.
+// @Tags admin-roles
+// @Accept json
+// @Security AdminToken
+// @Param name path string true "Role name"
+// @Param body body object true "Permission" SchemaExample({"action":"read","resource_type":"project"})
+// @Success 202 "Accepted"
+// @Failure 400 {object} model.ErrorResponse
+// @Failure 401 {object} model.ErrorResponse
+// @Failure 404 {object} model.ErrorResponse
+// @Failure 500 {object} model.ErrorResponse
+// @Router /admin/v1/roles/{name}/permissions [post]
 func (h *AdminHandler) AssignRolePermission(w http.ResponseWriter, r *http.Request) {
 	name := chi.URLParam(r, "name")
 
@@ -195,6 +272,18 @@ func (h *AdminHandler) AssignRolePermission(w http.ResponseWriter, r *http.Reque
 	w.WriteHeader(http.StatusAccepted)
 }
 
+// @Summary Remove permission from role
+// @Description Remove a permission from a role. Async — returns 202.
+// @Tags admin-roles
+// @Security AdminToken
+// @Param name path string true "Role name"
+// @Param action path string true "Action name"
+// @Param resource_type path string true "Resource type"
+// @Success 202 "Accepted"
+// @Failure 401 {object} model.ErrorResponse
+// @Failure 404 {object} model.ErrorResponse
+// @Failure 500 {object} model.ErrorResponse
+// @Router /admin/v1/roles/{name}/permissions/{action}/{resource_type} [delete]
 func (h *AdminHandler) RemoveRolePermission(w http.ResponseWriter, r *http.Request) {
 	name := chi.URLParam(r, "name")
 	action := chi.URLParam(r, "action")
@@ -225,6 +314,19 @@ func (h *AdminHandler) RemoveRolePermission(w http.ResponseWriter, r *http.Reque
 
 // --- User role assignments ---
 
+// @Summary Assign role to user
+// @Description Assign a role to a user, scoped to a resource. Async — returns 202.
+// @Tags admin-user-roles
+// @Accept json
+// @Security AdminToken
+// @Param user_id path string true "User UUID"
+// @Param body body object true "Role assignment" SchemaExample({"role_name":"editor","resource_type":"project","resource_id":"proj-1"})
+// @Success 202 "Accepted"
+// @Failure 400 {object} model.ErrorResponse
+// @Failure 401 {object} model.ErrorResponse
+// @Failure 404 {object} model.ErrorResponse
+// @Failure 500 {object} model.ErrorResponse
+// @Router /admin/v1/users/{user_id}/roles [post]
 func (h *AdminHandler) AssignUserRole(w http.ResponseWriter, r *http.Request) {
 	userIDStr := chi.URLParam(r, "user_id")
 	userID, err := uuid.Parse(userIDStr)
@@ -272,6 +374,19 @@ func (h *AdminHandler) AssignUserRole(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusAccepted)
 }
 
+// @Summary Revoke role from user
+// @Description Revoke a user's role assignment for a specific resource. Async — returns 202.
+// @Tags admin-user-roles
+// @Security AdminToken
+// @Param user_id path string true "User UUID"
+// @Param role_name path string true "Role name"
+// @Param resource_type path string true "Resource type"
+// @Param resource_id path string true "Resource ID"
+// @Success 202 "Accepted"
+// @Failure 400 {object} model.ErrorResponse
+// @Failure 401 {object} model.ErrorResponse
+// @Failure 500 {object} model.ErrorResponse
+// @Router /admin/v1/users/{user_id}/roles/{role_name}/{resource_type}/{resource_id} [delete]
 func (h *AdminHandler) RevokeUserRole(w http.ResponseWriter, r *http.Request) {
 	userIDStr := chi.URLParam(r, "user_id")
 	userID, err := uuid.Parse(userIDStr)
@@ -301,6 +416,19 @@ func (h *AdminHandler) RevokeUserRole(w http.ResponseWriter, r *http.Request) {
 
 // --- User permission overrides ---
 
+// @Summary Set permission override
+// @Description Set an ALLOW or DENY override for a user on a specific resource. Async — returns 202.
+// @Tags admin-overrides
+// @Accept json
+// @Security AdminToken
+// @Param user_id path string true "User UUID"
+// @Param body body object true "Override definition" SchemaExample({"action":"write","resource_type":"project","resource_id":"proj-1","effect":"DENY","reason":"suspended"})
+// @Success 202 "Accepted"
+// @Failure 400 {object} model.ErrorResponse
+// @Failure 401 {object} model.ErrorResponse
+// @Failure 404 {object} model.ErrorResponse
+// @Failure 500 {object} model.ErrorResponse
+// @Router /admin/v1/users/{user_id}/overrides [post]
 func (h *AdminHandler) SetOverride(w http.ResponseWriter, r *http.Request) {
 	userIDStr := chi.URLParam(r, "user_id")
 	userID, err := uuid.Parse(userIDStr)
@@ -352,6 +480,19 @@ func (h *AdminHandler) SetOverride(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusAccepted)
 }
 
+// @Summary Remove permission override
+// @Description Remove a user's permission override for a specific resource. Async — returns 202.
+// @Tags admin-overrides
+// @Security AdminToken
+// @Param user_id path string true "User UUID"
+// @Param action path string true "Action name"
+// @Param resource_type path string true "Resource type"
+// @Param resource_id path string true "Resource ID"
+// @Success 202 "Accepted"
+// @Failure 400 {object} model.ErrorResponse
+// @Failure 401 {object} model.ErrorResponse
+// @Failure 500 {object} model.ErrorResponse
+// @Router /admin/v1/users/{user_id}/overrides/{action}/{resource_type}/{resource_id} [delete]
 func (h *AdminHandler) RemoveOverride(w http.ResponseWriter, r *http.Request) {
 	userIDStr := chi.URLParam(r, "user_id")
 	userID, err := uuid.Parse(userIDStr)

@@ -10,6 +10,20 @@ import (
 	"github.com/google/uuid"
 )
 
+// @Summary Check authorization
+// @Description Check if a user is authorized to perform an action on a specific resource.
+// @Description Resolution order: DENY override > ALLOW override > role check > default deny.
+// @Tags query
+// @Produce json
+// @Param user_id query string true "User UUID"
+// @Param action query string true "Action name (e.g. read, write)"
+// @Param resource_type query string true "Resource type (e.g. project, repo)"
+// @Param resource_id query string true "Resource identifier"
+// @Success 200 {object} model.CheckResult
+// @Failure 400 {object} model.ErrorResponse
+// @Failure 404 {object} model.ErrorResponse
+// @Failure 500 {object} model.ErrorResponse
+// @Router /query/v1/check [get]
 func handleCheck(res *resolver.Resolver) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		userIDStr := r.URL.Query().Get("user_id")

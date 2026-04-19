@@ -9,6 +9,17 @@ import (
 	"github.com/google/uuid"
 )
 
+// @Summary List effective permissions
+// @Description List the effective permissions for a user, optionally filtered by resource type and resource ID.
+// @Tags query
+// @Produce json
+// @Param user_id query string true "User UUID"
+// @Param resource_type query string false "Filter by resource type"
+// @Param resource_id query string false "Filter by resource ID"
+// @Success 200 {object} map[string][]model.PermissionEntry
+// @Failure 400 {object} model.ErrorResponse
+// @Failure 500 {object} model.ErrorResponse
+// @Router /query/v1/permissions [get]
 func handlePermissions(res *resolver.Resolver) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		userIDStr := r.URL.Query().Get("user_id")

@@ -21,6 +21,8 @@ import (
 	"authz-service/internal/registry"
 	"authz-service/internal/resolver"
 
+	_ "authz-service/docs"
+
 	"github.com/hop-/goconfig"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/segmentio/kafka-go"

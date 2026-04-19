@@ -20,11 +20,24 @@ var HealthDeps struct {
 	AdminMode bool
 }
 
+// @Summary Liveness check
+// @Description Always returns 200 OK if the process is running.
+// @Tags health
+// @Produce plain
+// @Success 200 {string} string "ok"
+// @Router /healthz [get]
 func handleLiveness(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 	w.Write([]byte("ok"))
 }
 
+// @Summary Readiness check
+// @Description Checks DB, Redis, registry, and Kafka (if admin mode). Returns 503 if any check fails.
+// @Tags health
+// @Produce json
+// @Success 200 {object} map[string]interface{}
+// @Failure 503 {object} map[string]interface{}
+// @Router /readyz [get]
 func handleReadiness(w http.ResponseWriter, r *http.Request) {
 	checks := make(map[string]string)
 

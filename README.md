@@ -54,6 +54,18 @@ GET /healthz   — liveness (always 200)
 GET /readyz    — readiness (checks DB, Redis, registry)
 ```
 
+### Swagger / OpenAPI
+
+Auto-generated docs are served at `/swagger/index.html` when the API is running.
+
+To regenerate after code changes:
+
+```bash
+swag init -g cmd/api/main.go -o docs/ --parseDependency --parseInternal
+```
+
+The generated spec files live in `docs/` (`swagger.json`, `swagger.yaml`). These are committed so the API image serves them without needing the `swag` CLI at runtime.
+
 ## Configuration
 
 | Variable | Required | Default | Description |

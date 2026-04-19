@@ -1,0 +1,715 @@
+definitions:
+  authz-service_internal_model.APIError:
+    properties:
+      code:
+        type: string
+      message:
+        type: string
+    type: object
+  authz-service_internal_model.CheckResult:
+    properties:
+      allowed:
+        type: boolean
+      source:
+        type: string
+    type: object
+  authz-service_internal_model.ErrorResponse:
+    properties:
+      error:
+        $ref: '#/definitions/authz-service_internal_model.APIError'
+    type: object
+  authz-service_internal_model.Permission:
+    properties:
+      action:
+        type: string
+      created_at:
+        type: string
+      description:
+        type: string
+      resource_type:
+        type: string
+    type: object
+  authz-service_internal_model.PermissionEntry:
+    properties:
+      action:
+        type: string
+      resource_id:
+        type: string
+      resource_type:
+        type: string
+      scope:
+        additionalProperties:
+          type: string
+        type: object
+      source:
+        type: string
+    type: object
+  authz-service_internal_model.ResourcesResult:
+    properties:
+      resource_ids:
+        items:
+          type: string
+        type: array
+    type: object
+  authz-service_internal_model.Role:
+    properties:
+      created_at:
+        type: string
+      description:
+        type: string
+      name:
+        type: string
+    type: object
+info:
+  contact: {}
+paths:
+  /admin/v1/actions:
+    get:
+      description: Return all registered permission (action, resource_type) pairs.
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            items:
+              $ref: '#/definitions/authz-service_internal_model.Permission'
+            type: array
+        "401":
+          description: Unauthorized
+          schema:
+            $ref: '#/definitions/authz-service_internal_model.ErrorResponse'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/authz-service_internal_model.ErrorResponse'
+      security:
+      - AdminToken: []
+      summary: List all registered actions
+      tags:
+      - admin-actions
+    post:
+      consumes:
+      - application/json
+      description: Create a new permission entry (action + resource_type). Async —
+        returns 202.
+      parameters:
+      - description: Action definition
+        in: body
+        name: body
+        required: true
+        schema:
+          type: object
+      responses:
+        "202":
+          description: Accepted
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/authz-service_internal_model.ErrorResponse'
+        "401":
+          description: Unauthorized
+          schema:
+            $ref: '#/definitions/authz-service_internal_model.ErrorResponse'
+        "409":
+          description: Conflict
+          schema:
+            $ref: '#/definitions/authz-service_internal_model.ErrorResponse'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/authz-service_internal_model.ErrorResponse'
+      security:
+      - AdminToken: []
+      summary: Register a new action
+      tags:
+      - admin-actions
+  /admin/v1/actions/{action}/{resource_type}:
+    delete:
+      description: Delete a registered permission. Async — returns 202.
+      parameters:
+      - description: Action name
+        in: path
+        name: action
+        required: true
+        type: string
+      - description: Resource type
+        in: path
+        name: resource_type
+        required: true
+        type: string
+      responses:
+        "202":
+          description: Accepted
+        "401":
+          description: Unauthorized
+          schema:
+            $ref: '#/definitions/authz-service_internal_model.ErrorResponse'
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/authz-service_internal_model.ErrorResponse'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/authz-service_internal_model.ErrorResponse'
+      security:
+      - AdminToken: []
+      summary: Remove an action
+      tags:
+      - admin-actions
+  /admin/v1/roles:
+    get:
+      description: Return all registered roles.
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            items:
+              $ref: '#/definitions/authz-service_internal_model.Role'
+            type: array
+        "401":
+          description: Unauthorized
+          schema:
+            $ref: '#/definitions/authz-service_internal_model.ErrorResponse'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/authz-service_internal_model.ErrorResponse'
+      security:
+      - AdminToken: []
+      summary: List all roles
+      tags:
+      - admin-roles
+    post:
+      consumes:
+      - application/json
+      description: Create a new role. Async — returns 202.
+      parameters:
+      - description: Role definition
+        in: body
+        name: body
+        required: true
+        schema:
+          type: object
+      responses:
+        "202":
+          description: Accepted
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/authz-service_internal_model.ErrorResponse'
+        "401":
+          description: Unauthorized
+          schema:
+            $ref: '#/definitions/authz-service_internal_model.ErrorResponse'
+        "409":
+          description: Conflict
+          schema:
+            $ref: '#/definitions/authz-service_internal_model.ErrorResponse'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/authz-service_internal_model.ErrorResponse'
+      security:
+      - AdminToken: []
+      summary: Create a role
+      tags:
+      - admin-roles
+  /admin/v1/roles/{name}/permissions:
+    get:
+      description: Return all permissions assigned to a role.
+      parameters:
+      - description: Role name
+        in: path
+        name: name
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            items:
+              $ref: '#/definitions/authz-service_internal_model.Permission'
+            type: array
+        "401":
+          description: Unauthorized
+          schema:
+            $ref: '#/definitions/authz-service_internal_model.ErrorResponse'
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/authz-service_internal_model.ErrorResponse'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/authz-service_internal_model.ErrorResponse'
+      security:
+      - AdminToken: []
+      summary: List role permissions
+      tags:
+      - admin-roles
+    post:
+      consumes:
+      - application/json
+      description: Add a permission to a role. Async — returns 202.
+      parameters:
+      - description: Role name
+        in: path
+        name: name
+        required: true
+        type: string
+      - description: Permission
+        in: body
+        name: body
+        required: true
+        schema:
+          type: object
+      responses:
+        "202":
+          description: Accepted
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/authz-service_internal_model.ErrorResponse'
+        "401":
+          description: Unauthorized
+          schema:
+            $ref: '#/definitions/authz-service_internal_model.ErrorResponse'
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/authz-service_internal_model.ErrorResponse'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/authz-service_internal_model.ErrorResponse'
+      security:
+      - AdminToken: []
+      summary: Assign permission to role
+      tags:
+      - admin-roles
+  /admin/v1/roles/{name}/permissions/{action}/{resource_type}:
+    delete:
+      description: Remove a permission from a role. Async — returns 202.
+      parameters:
+      - description: Role name
+        in: path
+        name: name
+        required: true
+        type: string
+      - description: Action name
+        in: path
+        name: action
+        required: true
+        type: string
+      - description: Resource type
+        in: path
+        name: resource_type
+        required: true
+        type: string
+      responses:
+        "202":
+          description: Accepted
+        "401":
+          description: Unauthorized
+          schema:
+            $ref: '#/definitions/authz-service_internal_model.ErrorResponse'
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/authz-service_internal_model.ErrorResponse'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/authz-service_internal_model.ErrorResponse'
+      security:
+      - AdminToken: []
+      summary: Remove permission from role
+      tags:
+      - admin-roles
+  /admin/v1/users/{user_id}/overrides:
+    post:
+      consumes:
+      - application/json
+      description: Set an ALLOW or DENY override for a user on a specific resource.
+        Async — returns 202.
+      parameters:
+      - description: User UUID
+        in: path
+        name: user_id
+        required: true
+        type: string
+      - description: Override definition
+        in: body
+        name: body
+        required: true
+        schema:
+          type: object
+      responses:
+        "202":
+          description: Accepted
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/authz-service_internal_model.ErrorResponse'
+        "401":
+          description: Unauthorized
+          schema:
+            $ref: '#/definitions/authz-service_internal_model.ErrorResponse'
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/authz-service_internal_model.ErrorResponse'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/authz-service_internal_model.ErrorResponse'
+      security:
+      - AdminToken: []
+      summary: Set permission override
+      tags:
+      - admin-overrides
+  /admin/v1/users/{user_id}/overrides/{action}/{resource_type}/{resource_id}:
+    delete:
+      description: Remove a user's permission override for a specific resource. Async
+        — returns 202.
+      parameters:
+      - description: User UUID
+        in: path
+        name: user_id
+        required: true
+        type: string
+      - description: Action name
+        in: path
+        name: action
+        required: true
+        type: string
+      - description: Resource type
+        in: path
+        name: resource_type
+        required: true
+        type: string
+      - description: Resource ID
+        in: path
+        name: resource_id
+        required: true
+        type: string
+      responses:
+        "202":
+          description: Accepted
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/authz-service_internal_model.ErrorResponse'
+        "401":
+          description: Unauthorized
+          schema:
+            $ref: '#/definitions/authz-service_internal_model.ErrorResponse'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/authz-service_internal_model.ErrorResponse'
+      security:
+      - AdminToken: []
+      summary: Remove permission override
+      tags:
+      - admin-overrides
+  /admin/v1/users/{user_id}/roles:
+    post:
+      consumes:
+      - application/json
+      description: Assign a role to a user, scoped to a resource. Async — returns
+        202.
+      parameters:
+      - description: User UUID
+        in: path
+        name: user_id
+        required: true
+        type: string
+      - description: Role assignment
+        in: body
+        name: body
+        required: true
+        schema:
+          type: object
+      responses:
+        "202":
+          description: Accepted
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/authz-service_internal_model.ErrorResponse'
+        "401":
+          description: Unauthorized
+          schema:
+            $ref: '#/definitions/authz-service_internal_model.ErrorResponse'
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/authz-service_internal_model.ErrorResponse'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/authz-service_internal_model.ErrorResponse'
+      security:
+      - AdminToken: []
+      summary: Assign role to user
+      tags:
+      - admin-user-roles
+  /admin/v1/users/{user_id}/roles/{role_name}/{resource_type}/{resource_id}:
+    delete:
+      description: Revoke a user's role assignment for a specific resource. Async
+        — returns 202.
+      parameters:
+      - description: User UUID
+        in: path
+        name: user_id
+        required: true
+        type: string
+      - description: Role name
+        in: path
+        name: role_name
+        required: true
+        type: string
+      - description: Resource type
+        in: path
+        name: resource_type
+        required: true
+        type: string
+      - description: Resource ID
+        in: path
+        name: resource_id
+        required: true
+        type: string
+      responses:
+        "202":
+          description: Accepted
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/authz-service_internal_model.ErrorResponse'
+        "401":
+          description: Unauthorized
+          schema:
+            $ref: '#/definitions/authz-service_internal_model.ErrorResponse'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/authz-service_internal_model.ErrorResponse'
+      security:
+      - AdminToken: []
+      summary: Revoke role from user
+      tags:
+      - admin-user-roles
+  /healthz:
+    get:
+      description: Always returns 200 OK if the process is running.
+      produces:
+      - text/plain
+      responses:
+        "200":
+          description: ok
+          schema:
+            type: string
+      summary: Liveness check
+      tags:
+      - health
+  /query/v1/check:
+    get:
+      description: |-
+        Check if a user is authorized to perform an action on a specific resource.
+        Resolution order: DENY override > ALLOW override > role check > default deny.
+      parameters:
+      - description: User UUID
+        in: query
+        name: user_id
+        required: true
+        type: string
+      - description: Action name (e.g. read, write)
+        in: query
+        name: action
+        required: true
+        type: string
+      - description: Resource type (e.g. project, repo)
+        in: query
+        name: resource_type
+        required: true
+        type: string
+      - description: Resource identifier
+        in: query
+        name: resource_id
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/authz-service_internal_model.CheckResult'
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/authz-service_internal_model.ErrorResponse'
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/authz-service_internal_model.ErrorResponse'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/authz-service_internal_model.ErrorResponse'
+      summary: Check authorization
+      tags:
+      - query
+  /query/v1/permissions:
+    get:
+      description: List the effective permissions for a user, optionally filtered
+        by resource type and resource ID.
+      parameters:
+      - description: User UUID
+        in: query
+        name: user_id
+        required: true
+        type: string
+      - description: Filter by resource type
+        in: query
+        name: resource_type
+        type: string
+      - description: Filter by resource ID
+        in: query
+        name: resource_id
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            additionalProperties:
+              items:
+                $ref: '#/definitions/authz-service_internal_model.PermissionEntry'
+              type: array
+            type: object
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/authz-service_internal_model.ErrorResponse'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/authz-service_internal_model.ErrorResponse'
+      summary: List effective permissions
+      tags:
+      - query
+  /query/v1/resources:
+    get:
+      description: Return all resource IDs that a user is authorized to perform an
+        action on.
+      parameters:
+      - description: User UUID
+        in: query
+        name: user_id
+        required: true
+        type: string
+      - description: Action name
+        in: query
+        name: action
+        required: true
+        type: string
+      - description: Resource type
+        in: query
+        name: resource_type
+        required: true
+        type: string
+      - description: JSON-encoded scope filter object
+        in: query
+        name: scope_filter
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/authz-service_internal_model.ResourcesResult'
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/authz-service_internal_model.ErrorResponse'
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/authz-service_internal_model.ErrorResponse'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/authz-service_internal_model.ErrorResponse'
+      summary: List authorized resources
+      tags:
+      - query
+  /query/v1/resources/filter:
+    post:
+      consumes:
+      - application/json
+      description: Given a list of candidate resource IDs, return only those the user
+        is authorized for.
+      parameters:
+      - description: Filter request
+        in: body
+        name: body
+        required: true
+        schema:
+          type: object
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            additionalProperties:
+              items:
+                type: string
+              type: array
+            type: object
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/authz-service_internal_model.ErrorResponse'
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/authz-service_internal_model.ErrorResponse'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/authz-service_internal_model.ErrorResponse'
+      summary: Filter authorized resource IDs
+      tags:
+      - query
+  /readyz:
+    get:
+      description: Checks DB, Redis, registry, and Kafka (if admin mode). Returns
+        503 if any check fails.
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            additionalProperties: true
+            type: object
+        "503":
+          description: Service Unavailable
+          schema:
+            additionalProperties: true
+            type: object
+      summary: Readiness check
+      tags:
+      - health
+swagger: "2.0"

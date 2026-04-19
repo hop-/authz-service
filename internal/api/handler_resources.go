@@ -11,6 +11,19 @@ import (
 	"github.com/google/uuid"
 )
 
+// @Summary List authorized resources
+// @Description Return all resource IDs that a user is authorized to perform an action on.
+// @Tags query
+// @Produce json
+// @Param user_id query string true "User UUID"
+// @Param action query string true "Action name"
+// @Param resource_type query string true "Resource type"
+// @Param scope_filter query string false "JSON-encoded scope filter object"
+// @Success 200 {object} model.ResourcesResult
+// @Failure 400 {object} model.ErrorResponse
+// @Failure 404 {object} model.ErrorResponse
+// @Failure 500 {object} model.ErrorResponse
+// @Router /query/v1/resources [get]
 func handleResources(res *resolver.Resolver) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		userIDStr := r.URL.Query().Get("user_id")
@@ -58,6 +71,17 @@ func handleResources(res *resolver.Resolver) http.HandlerFunc {
 	}
 }
 
+// @Summary Filter authorized resource IDs
+// @Description Given a list of candidate resource IDs, return only those the user is authorized for.
+// @Tags query
+// @Accept json
+// @Produce json
+// @Param body body object true "Filter request" SchemaExample({"user_id":"uuid","action":"read","resource_type":"project","candidate_ids":["id1","id2"]})
+// @Success 200 {object} map[string][]string
+// @Failure 400 {object} model.ErrorResponse
+// @Failure 404 {object} model.ErrorResponse
+// @Failure 500 {object} model.ErrorResponse
+// @Router /query/v1/resources/filter [post]
 func handleFilter(res *resolver.Resolver) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		var body struct {
