@@ -3,3 +3,7 @@
 /api
 /api.exe
 .env*
+Dockerfile
+Dockerfile.migrate
+.dockerignore
+docker-compose.yml
