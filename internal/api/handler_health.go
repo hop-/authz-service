@@ -7,6 +7,7 @@ import (
 
 	"authz-service/internal/cache"
 	"authz-service/internal/db"
+	"authz-service/internal/model"
 	"authz-service/internal/producer"
 	"authz-service/internal/registry"
 )
@@ -23,20 +24,19 @@ var HealthDeps struct {
 // @Summary Liveness check
 // @Description Always returns 200 OK if the process is running.
 // @Tags health
-// @Produce plain
-// @Success 200 {string} string "ok"
+// @Produce json
+// @Success 200 {object} model.HealthResponse
 // @Router /healthz [get]
 func handleLiveness(w http.ResponseWriter, r *http.Request) {
-	w.WriteHeader(http.StatusOK)
-	w.Write([]byte("ok"))
+	writeJSON(w, http.StatusOK, model.HealthResponse{Status: "ok"})
 }
 
 // @Summary Readiness check
 // @Description Checks DB, Redis, registry, and Kafka (if admin mode). Returns 503 if any check fails.
 // @Tags health
 // @Produce json
-// @Success 200 {object} map[string]interface{}
-// @Failure 503 {object} map[string]interface{}
+// @Success 200 {object} model.ReadinessResponse
+// @Failure 503 {object} model.ReadinessResponse
 // @Router /readyz [get]
 func handleReadiness(w http.ResponseWriter, r *http.Request) {
 	checks := make(map[string]string)
@@ -86,12 +86,15 @@ func handleReadiness(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	status := http.StatusOK
+	statusCode := http.StatusOK
+	statusStr := "ok"
 	if !allOK {
-		status = http.StatusServiceUnavailable
+		statusCode = http.StatusServiceUnavailable
+		statusStr = "unavailable"
 	}
 
-	writeJSON(w, status, map[string]interface{}{
-		"checks": checks,
+	writeJSON(w, statusCode, model.ReadinessResponse{
+		Status: statusStr,
+		Checks: checks,
 	})
 }

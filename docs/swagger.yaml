@@ -18,6 +18,12 @@ definitions:
       error:
         $ref: '#/definitions/authz-service_internal_model.APIError'
     type: object
+  authz-service_internal_model.HealthResponse:
+    properties:
+      status:
+        example: ok
+        type: string
+    type: object
   authz-service_internal_model.Permission:
     properties:
       action:
@@ -42,6 +48,16 @@ definitions:
           type: string
         type: object
       source:
+        type: string
+    type: object
+  authz-service_internal_model.ReadinessResponse:
+    properties:
+      checks:
+        additionalProperties:
+          type: string
+        type: object
+      status:
+        example: ok
         type: string
     type: object
   authz-service_internal_model.ResourcesResult:
@@ -510,12 +526,12 @@ paths:
     get:
       description: Always returns 200 OK if the process is running.
       produces:
-      - text/plain
+      - application/json
       responses:
         "200":
-          description: ok
+          description: OK
           schema:
-            type: string
+            $ref: '#/definitions/authz-service_internal_model.HealthResponse'
       summary: Liveness check
       tags:
       - health
@@ -702,13 +718,11 @@ paths:
         "200":
           description: OK
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/authz-service_internal_model.ReadinessResponse'
         "503":
           description: Service Unavailable
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/authz-service_internal_model.ReadinessResponse'
       summary: Readiness check
       tags:
       - health

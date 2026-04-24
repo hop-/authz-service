@@ -701,7 +701,7 @@ const docTemplate = `{
             "get": {
                 "description": "Always returns 200 OK if the process is running.",
                 "produces": [
-                    "text/plain"
+                    "application/json"
                 ],
                 "tags": [
                     "health"
@@ -709,9 +709,9 @@ const docTemplate = `{
                 "summary": "Liveness check",
                 "responses": {
                     "200": {
-                        "description": "ok",
+                        "description": "OK",
                         "schema": {
-                            "type": "string"
+                            "$ref": "#/definitions/authz-service_internal_model.HealthResponse"
                         }
                     }
                 }
@@ -983,15 +983,13 @@ const docTemplate = `{
                     "200": {
                         "description": "OK",
                         "schema": {
-                            "type": "object",
-                            "additionalProperties": true
+                            "$ref": "#/definitions/authz-service_internal_model.ReadinessResponse"
                         }
                     },
                     "503": {
                         "description": "Service Unavailable",
                         "schema": {
-                            "type": "object",
-                            "additionalProperties": true
+                            "$ref": "#/definitions/authz-service_internal_model.ReadinessResponse"
                         }
                     }
                 }
@@ -1026,6 +1024,15 @@ const docTemplate = `{
             "properties": {
                 "error": {
                     "$ref": "#/definitions/authz-service_internal_model.APIError"
+                }
+            }
+        },
+        "authz-service_internal_model.HealthResponse": {
+            "type": "object",
+            "properties": {
+                "status": {
+                    "type": "string",
+                    "example": "ok"
                 }
             }
         },
@@ -1066,6 +1073,21 @@ const docTemplate = `{
                 },
                 "source": {
                     "type": "string"
+                }
+            }
+        },
+        "authz-service_internal_model.ReadinessResponse": {
+            "type": "object",
+            "properties": {
+                "checks": {
+                    "type": "object",
+                    "additionalProperties": {
+                        "type": "string"
+                    }
+                },
+                "status": {
+                    "type": "string",
+                    "example": "ok"
                 }
             }
         },
