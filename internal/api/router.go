@@ -1,6 +1,7 @@
 package api
 
 import (
+	"crypto/subtle"
 	"net/http"
 
 	"authz-service/internal/config"
@@ -10,7 +11,7 @@ import (
 	httpSwagger "github.com/swaggo/http-swagger"
 )
 
-func NewRouter(res *resolver.Resolver, adminHandler *AdminHandler, cfg *config.Config) http.Handler {
+func NewRouter(res *resolver.Resolver, adminHandler *AdminHandler, health *HealthHandler, cfg *config.Config) http.Handler {
 	r := chi.NewRouter()
 	r.Use(RequestIDMiddleware, LoggingMiddleware, RecoveryMiddleware)
 
@@ -20,8 +21,8 @@ func NewRouter(res *resolver.Resolver, adminHandler *AdminHandler, cfg *config.C
 		r.Mount("/admin/v1", adminRouter(adminHandler, cfg.AdminToken))
 	}
 
-	r.Get("/healthz", handleLiveness)
-	r.Get("/readyz", handleReadiness)
+	r.Get("/healthz", health.Liveness)
+	r.Get("/readyz", health.Readiness)
 
 	r.Get("/swagger/*", httpSwagger.WrapHandler)
 
@@ -72,7 +73,7 @@ func adminAuthMiddleware(token string) func(http.Handler) http.Handler {
 				writeError(w, http.StatusUnauthorized, "missing_token", "X-Admin-Token header is required")
 				return
 			}
-			if t != token {
+			if subtle.ConstantTimeCompare([]byte(t), []byte(token)) != 1 {
 				writeError(w, http.StatusForbidden, "invalid_token", "invalid admin token")
 				return
 			}

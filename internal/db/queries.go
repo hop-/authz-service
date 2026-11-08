@@ -3,6 +3,8 @@ package db
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"time"
 
 	"authz-service/internal/model"
@@ -69,13 +71,15 @@ FROM user_permission_overrides upo
 WHERE upo.user_id = $1 AND upo.permission_id = $2 AND upo.effect = 'DENY'
   AND (upo.expires_at IS NULL OR upo.expires_at > NOW())`
 
-	// List all permissions for a user (for GET /query/v1/permissions)
+	// GET /query/v1/permissions: raw role-grant rows. A role grants a permission
+	// only on assignments of the permission's own resource type.
 	listUserPermissionsQuery = `SELECT p.action, p.resource_type, ur.resource_id, ur.scope, r.name AS source
 FROM user_roles ur
 JOIN role_permissions rp ON rp.role_id = ur.role_id
 JOIN permissions p ON p.id = rp.permission_id
 JOIN roles r ON r.id = ur.role_id
 WHERE ur.user_id = $1
+  AND p.resource_type = ur.resource_type
   AND (ur.expires_at IS NULL OR ur.expires_at > NOW())`
 
 	listUserPermissionsWithResourceQuery = `SELECT p.action, p.resource_type, ur.resource_id, ur.scope, r.name AS source
@@ -84,6 +88,7 @@ JOIN role_permissions rp ON rp.role_id = ur.role_id
 JOIN permissions p ON p.id = rp.permission_id
 JOIN roles r ON r.id = ur.role_id
 WHERE ur.user_id = $1
+  AND p.resource_type = ur.resource_type
   AND ur.resource_type = $2
   AND ur.resource_id = $3
   AND (ur.expires_at IS NULL OR ur.expires_at > NOW())`
@@ -94,9 +99,11 @@ JOIN role_permissions rp ON rp.role_id = ur.role_id
 JOIN permissions p ON p.id = rp.permission_id
 JOIN roles r ON r.id = ur.role_id
 WHERE ur.user_id = $1
+  AND p.resource_type = ur.resource_type
   AND ur.resource_type = $2
   AND (ur.expires_at IS NULL OR ur.expires_at > NOW())`
 
+	// GET /query/v1/permissions: raw override rows, both effects (merged in resolver.List).
 	listUserOverridesQuery = `SELECT p.action, p.resource_type, upo.resource_id, upo.scope, upo.effect
 FROM user_permission_overrides upo
 JOIN permissions p ON p.id = upo.permission_id
@@ -143,17 +150,35 @@ SET effect = EXCLUDED.effect, reason = EXCLUDED.reason, set_by = EXCLUDED.set_by
 
 	deleteOverrideQuery = `DELETE FROM user_permission_overrides WHERE user_id = $1 AND permission_id = $2 AND resource_id = $3`
 
-	insertPermissionQuery = `INSERT INTO permissions (action, resource_type, description) VALUES ($1, $2, $3) RETURNING id`
+	// Idempotent insert-or-select: returns the existing id for an existing natural key.
+	insertPermissionQuery = `WITH ins AS (
+  INSERT INTO permissions (action, resource_type, description) VALUES ($1, $2, $3)
+  ON CONFLICT (action, resource_type) DO NOTHING RETURNING id)
+SELECT id FROM ins
+UNION ALL
+SELECT id FROM permissions WHERE action = $1 AND resource_type = $2
+LIMIT 1`
 
 	deletePermissionQuery = `DELETE FROM permissions WHERE action = $1 AND resource_type = $2`
 
-	insertRoleQuery = `INSERT INTO roles (name, description) VALUES ($1, $2) RETURNING id`
+	// Idempotent insert-or-select: returns the existing id for an existing name.
+	insertRoleQuery = `WITH ins AS (
+  INSERT INTO roles (name, description) VALUES ($1, $2)
+  ON CONFLICT (name) DO NOTHING RETURNING id)
+SELECT id FROM ins
+UNION ALL
+SELECT id FROM roles WHERE name = $1
+LIMIT 1`
 
 	deleteRoleQuery = `DELETE FROM roles WHERE name = $1`
 
 	insertRolePermissionQuery = `INSERT INTO role_permissions (role_id, permission_id) VALUES ($1, $2) ON CONFLICT DO NOTHING`
 
 	deleteRolePermissionQuery = `DELETE FROM role_permissions WHERE role_id = $1 AND permission_id = $2`
+
+	// Worker id lookups (primary DB), used by duplicate-path follow-ups
+	permissionIDQuery = `SELECT id FROM permissions WHERE action = $1 AND resource_type = $2`
+	roleIDQuery       = `SELECT id FROM roles WHERE name = $1`
 )
 
 // Queries wraps a pgxpool.Pool and provides typed query methods.
@@ -245,72 +270,90 @@ func (q *Queries) Resources(ctx context.Context, userID uuid.UUID, permissionID 
 	return ids, rows.Err()
 }
 
-// ListUserPermissions returns all resolved permissions for a user.
-func (q *Queries) ListUserPermissions(ctx context.Context, userID uuid.UUID, resourceType, resourceID string) ([]model.PermissionEntry, error) {
-	var entries []model.PermissionEntry
-
-	// Role-based permissions
+// UserRoleGrants returns the user's active role-grant rows, optionally filtered
+// by resource type, or by resource type and id. Rows are raw: precedence
+// against overrides is applied by the resolver.
+func (q *Queries) UserRoleGrants(ctx context.Context, userID uuid.UUID, resourceType, resourceID string) ([]model.RoleGrant, error) {
 	var rows pgx.Rows
 	var err error
-	if resourceType != "" && resourceID != "" {
+	switch {
+	case resourceType != "" && resourceID != "":
 		rows, err = q.pool.Query(ctx, listUserPermissionsWithResourceQuery, userID, resourceType, resourceID)
-	} else if resourceType != "" {
+	case resourceType != "":
 		rows, err = q.pool.Query(ctx, listUserPermissionsWithTypeQuery, userID, resourceType)
-	} else {
+	default:
 		rows, err = q.pool.Query(ctx, listUserPermissionsQuery, userID)
 	}
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("query role grants: %w", err)
 	}
 	defer rows.Close()
 
+	var grants []model.RoleGrant
 	for rows.Next() {
-		var e model.PermissionEntry
+		var g model.RoleGrant
 		var scopeBytes []byte
-		var roleName string
-		if err := rows.Scan(&e.Action, &e.ResourceType, &e.ResourceID, &scopeBytes, &roleName); err != nil {
+		if err := rows.Scan(&g.Action, &g.ResourceType, &g.ResourceID, &scopeBytes, &g.RoleName); err != nil {
+			return nil, fmt.Errorf("scan role grant: %w", err)
+		}
+		if g.Scope, err = decodeScope(scopeBytes); err != nil {
 			return nil, err
 		}
-		if scopeBytes != nil {
-			_ = json.Unmarshal(scopeBytes, &e.Scope)
-		}
-		e.Source = "role:" + roleName
-		entries = append(entries, e)
+		grants = append(grants, g)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("iterate role grants: %w", err)
 	}
+	return grants, nil
+}
 
-	// Override-based permissions
-	var overrideRows pgx.Rows
-	if resourceType != "" && resourceID != "" {
-		overrideRows, err = q.pool.Query(ctx, listUserOverridesWithResourceQuery, userID, resourceType, resourceID)
-	} else if resourceType != "" {
-		overrideRows, err = q.pool.Query(ctx, listUserOverridesWithTypeQuery, userID, resourceType)
-	} else {
-		overrideRows, err = q.pool.Query(ctx, listUserOverridesQuery, userID)
+// UserOverrides returns the user's active override rows (ALLOW and DENY),
+// optionally filtered by resource type, or by resource type and id.
+func (q *Queries) UserOverrides(ctx context.Context, userID uuid.UUID, resourceType, resourceID string) ([]model.OverrideGrant, error) {
+	var rows pgx.Rows
+	var err error
+	switch {
+	case resourceType != "" && resourceID != "":
+		rows, err = q.pool.Query(ctx, listUserOverridesWithResourceQuery, userID, resourceType, resourceID)
+	case resourceType != "":
+		rows, err = q.pool.Query(ctx, listUserOverridesWithTypeQuery, userID, resourceType)
+	default:
+		rows, err = q.pool.Query(ctx, listUserOverridesQuery, userID)
 	}
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("query overrides: %w", err)
 	}
-	defer overrideRows.Close()
+	defer rows.Close()
 
-	for overrideRows.Next() {
-		var e model.PermissionEntry
+	var overrides []model.OverrideGrant
+	for rows.Next() {
+		var o model.OverrideGrant
 		var scopeBytes []byte
 		var effect string
-		if err := overrideRows.Scan(&e.Action, &e.ResourceType, &e.ResourceID, &scopeBytes, &effect); err != nil {
+		if err := rows.Scan(&o.Action, &o.ResourceType, &o.ResourceID, &scopeBytes, &effect); err != nil {
+			return nil, fmt.Errorf("scan override: %w", err)
+		}
+		if o.Scope, err = decodeScope(scopeBytes); err != nil {
 			return nil, err
 		}
-		if scopeBytes != nil {
-			_ = json.Unmarshal(scopeBytes, &e.Scope)
-		}
-		if model.Effect(effect) == model.EffectAllow {
-			e.Source = "override:allow"
-			entries = append(entries, e)
-		}
+		o.Effect = model.Effect(effect)
+		overrides = append(overrides, o)
 	}
-	return entries, overrideRows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate overrides: %w", err)
+	}
+	return overrides, nil
+}
+
+func decodeScope(b []byte) (map[string]string, error) {
+	if b == nil {
+		return nil, nil
+	}
+	var scope map[string]string
+	if err := json.Unmarshal(b, &scope); err != nil {
+		return nil, fmt.Errorf("decode scope: %w", err)
+	}
+	return scope, nil
 }
 
 // LoadPermissions reads all permissions for the registry.
@@ -410,94 +453,173 @@ func (q *Queries) ListRolePermissions(ctx context.Context, roleID int16) ([]mode
 	return perms, rows.Err()
 }
 
-// --- Worker write methods ---
+// --- Worker write path ---
 
-// InsertEventLog inserts an event_id for deduplication. Returns true if inserted (new event).
-func (q *Queries) InsertEventLog(ctx context.Context, tx pgx.Tx, eventID uuid.UUID, eventType string) (bool, error) {
+// Writer is the set of writes the worker may perform inside an ApplyEvent
+// transaction. It is defined here, next to its implementation, because the
+// ApplyEvent callback type must be nameable by both db and worker.
+type Writer interface {
+	InsertUserRole(ctx context.Context, userID uuid.UUID, roleID int16, resourceType, resourceID string,
+		scope map[string]string, grantedBy uuid.UUID, grantedAt time.Time, expiresAt *time.Time) error
+	DeleteUserRole(ctx context.Context, userID uuid.UUID, roleID int16, resourceType, resourceID string) error
+	UpsertOverride(ctx context.Context, userID uuid.UUID, permissionID int16, resourceID string, scope map[string]string,
+		effect model.Effect, reason string, setBy uuid.UUID, createdAt time.Time, expiresAt *time.Time) error
+	DeleteOverride(ctx context.Context, userID uuid.UUID, permissionID int16, resourceID string) error
+	// InsertPermission is idempotent: it returns the existing id when (action, resourceType) already exists.
+	InsertPermission(ctx context.Context, action, resourceType, description string) (int16, error)
+	DeletePermission(ctx context.Context, action, resourceType string) error
+	// InsertRole is idempotent: it returns the existing id when the name already exists.
+	InsertRole(ctx context.Context, name, description string) (int16, error)
+	DeleteRole(ctx context.Context, name string) error
+	InsertRolePermission(ctx context.Context, roleID, permissionID int16) error
+	DeleteRolePermission(ctx context.Context, roleID, permissionID int16) error
+}
+
+// ApplyEvent runs fn in one transaction together with the event_log
+// deduplication insert. If eventID is already recorded, it rolls back and
+// returns (false, nil) without calling fn. Otherwise it runs fn, commits, and
+// returns (true, nil).
+func (q *Queries) ApplyEvent(ctx context.Context, eventID uuid.UUID, eventType string, fn func(Writer) error) (bool, error) {
+	tx, err := q.pool.Begin(ctx)
+	if err != nil {
+		return false, fmt.Errorf("begin tx: %w", err)
+	}
+	// Rollback after a successful Commit is a no-op; its error carries no information then.
+	defer func() { _ = tx.Rollback(ctx) }()
+
 	tag, err := tx.Exec(ctx, insertEventLogQuery, eventID, eventType)
 	if err != nil {
+		return false, fmt.Errorf("insert event_log: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return false, nil
+	}
+
+	if err := fn(txWriter{tx: tx}); err != nil {
 		return false, err
 	}
-	return tag.RowsAffected() == 1, nil
+
+	if err := tx.Commit(ctx); err != nil {
+		return false, fmt.Errorf("commit tx: %w", err)
+	}
+	return true, nil
 }
 
-// InsertUserRole inserts a user-role assignment.
-func (q *Queries) InsertUserRole(ctx context.Context, tx pgx.Tx, userID uuid.UUID, roleID int16, resourceType, resourceID string, scope map[string]string, grantedBy uuid.UUID, grantedAt time.Time, expiresAt *time.Time) error {
+// PermissionID looks up a permission's surrogate id by natural key.
+// found is false (with a nil error) when no such permission exists.
+func (q *Queries) PermissionID(ctx context.Context, action, resourceType string) (int16, bool, error) {
+	var id int16
+	err := q.pool.QueryRow(ctx, permissionIDQuery, action, resourceType).Scan(&id)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return 0, false, nil
+	}
+	if err != nil {
+		return 0, false, fmt.Errorf("lookup permission id: %w", err)
+	}
+	return id, true, nil
+}
+
+// RoleID looks up a role's surrogate id by name.
+// found is false (with a nil error) when no such role exists.
+func (q *Queries) RoleID(ctx context.Context, name string) (int16, bool, error) {
+	var id int16
+	err := q.pool.QueryRow(ctx, roleIDQuery, name).Scan(&id)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return 0, false, nil
+	}
+	if err != nil {
+		return 0, false, fmt.Errorf("lookup role id: %w", err)
+	}
+	return id, true, nil
+}
+
+// txWriter implements Writer on an open transaction.
+type txWriter struct {
+	tx pgx.Tx
+}
+
+func (w txWriter) InsertUserRole(ctx context.Context, userID uuid.UUID, roleID int16, resourceType, resourceID string, scope map[string]string, grantedBy uuid.UUID, grantedAt time.Time, expiresAt *time.Time) error {
 	scopeJSON, err := json.Marshal(scope)
 	if err != nil {
-		return err
+		return fmt.Errorf("marshal scope: %w", err)
 	}
-	_, err = tx.Exec(ctx, insertUserRoleQuery, userID, roleID, resourceType, resourceID, scopeJSON, grantedBy, grantedAt, expiresAt)
-	return err
+	if _, err := w.tx.Exec(ctx, insertUserRoleQuery, userID, roleID, resourceType, resourceID, scopeJSON, grantedBy, grantedAt, expiresAt); err != nil {
+		return fmt.Errorf("insert user_role: %w", err)
+	}
+	return nil
 }
 
-// DeleteUserRole deletes a user-role assignment.
-func (q *Queries) DeleteUserRole(ctx context.Context, tx pgx.Tx, userID uuid.UUID, roleID int16, resourceType, resourceID string) error {
-	_, err := tx.Exec(ctx, deleteUserRoleQuery, userID, roleID, resourceType, resourceID)
-	return err
+func (w txWriter) DeleteUserRole(ctx context.Context, userID uuid.UUID, roleID int16, resourceType, resourceID string) error {
+	if _, err := w.tx.Exec(ctx, deleteUserRoleQuery, userID, roleID, resourceType, resourceID); err != nil {
+		return fmt.Errorf("delete user_role: %w", err)
+	}
+	return nil
 }
 
-// UpsertOverride inserts or updates a permission override.
-func (q *Queries) UpsertOverride(ctx context.Context, tx pgx.Tx, userID uuid.UUID, permissionID int16, resourceID string, scope map[string]string, effect model.Effect, reason string, setBy uuid.UUID, createdAt time.Time, expiresAt *time.Time) error {
+func (w txWriter) UpsertOverride(ctx context.Context, userID uuid.UUID, permissionID int16, resourceID string, scope map[string]string, effect model.Effect, reason string, setBy uuid.UUID, createdAt time.Time, expiresAt *time.Time) error {
 	scopeJSON, err := json.Marshal(scope)
 	if err != nil {
-		return err
+		return fmt.Errorf("marshal scope: %w", err)
 	}
-	_, err = tx.Exec(ctx, upsertOverrideQuery, userID, permissionID, resourceID, scopeJSON, string(effect), reason, setBy, createdAt, expiresAt)
-	return err
+	if _, err := w.tx.Exec(ctx, upsertOverrideQuery, userID, permissionID, resourceID, scopeJSON, string(effect), reason, setBy, createdAt, expiresAt); err != nil {
+		return fmt.Errorf("upsert override: %w", err)
+	}
+	return nil
 }
 
-// DeleteOverride deletes a permission override.
-func (q *Queries) DeleteOverride(ctx context.Context, tx pgx.Tx, userID uuid.UUID, permissionID int16, resourceID string) error {
-	_, err := tx.Exec(ctx, deleteOverrideQuery, userID, permissionID, resourceID)
-	return err
+func (w txWriter) DeleteOverride(ctx context.Context, userID uuid.UUID, permissionID int16, resourceID string) error {
+	if _, err := w.tx.Exec(ctx, deleteOverrideQuery, userID, permissionID, resourceID); err != nil {
+		return fmt.Errorf("delete override: %w", err)
+	}
+	return nil
 }
 
-// InsertPermission inserts a new permission and returns its surrogate id.
-func (q *Queries) InsertPermission(ctx context.Context, tx pgx.Tx, action, resourceType, description string) (int16, error) {
+func (w txWriter) InsertPermission(ctx context.Context, action, resourceType, description string) (int16, error) {
 	var id int16
-	err := tx.QueryRow(ctx, insertPermissionQuery, action, resourceType, description).Scan(&id)
-	return id, err
+	if err := w.tx.QueryRow(ctx, insertPermissionQuery, action, resourceType, description).Scan(&id); err != nil {
+		return 0, fmt.Errorf("insert permission: %w", err)
+	}
+	return id, nil
 }
 
-// DeletePermission deletes a permission by natural key. CASCADE removes role_permissions and overrides.
-func (q *Queries) DeletePermission(ctx context.Context, tx pgx.Tx, action, resourceType string) error {
-	_, err := tx.Exec(ctx, deletePermissionQuery, action, resourceType)
-	return err
+func (w txWriter) DeletePermission(ctx context.Context, action, resourceType string) error {
+	if _, err := w.tx.Exec(ctx, deletePermissionQuery, action, resourceType); err != nil {
+		return fmt.Errorf("delete permission: %w", err)
+	}
+	return nil
 }
 
-// InsertRole inserts a new role and returns its surrogate id.
-func (q *Queries) InsertRole(ctx context.Context, tx pgx.Tx, name, description string) (int16, error) {
+func (w txWriter) InsertRole(ctx context.Context, name, description string) (int16, error) {
 	var id int16
-	err := tx.QueryRow(ctx, insertRoleQuery, name, description).Scan(&id)
-	return id, err
+	if err := w.tx.QueryRow(ctx, insertRoleQuery, name, description).Scan(&id); err != nil {
+		return 0, fmt.Errorf("insert role: %w", err)
+	}
+	return id, nil
 }
 
-// DeleteRole deletes a role by name. CASCADE removes role_permissions and user_roles.
-func (q *Queries) DeleteRole(ctx context.Context, tx pgx.Tx, name string) error {
-	_, err := tx.Exec(ctx, deleteRoleQuery, name)
-	return err
+func (w txWriter) DeleteRole(ctx context.Context, name string) error {
+	if _, err := w.tx.Exec(ctx, deleteRoleQuery, name); err != nil {
+		return fmt.Errorf("delete role: %w", err)
+	}
+	return nil
 }
 
-// InsertRolePermission links a role to a permission.
-func (q *Queries) InsertRolePermission(ctx context.Context, tx pgx.Tx, roleID, permissionID int16) error {
-	_, err := tx.Exec(ctx, insertRolePermissionQuery, roleID, permissionID)
-	return err
+func (w txWriter) InsertRolePermission(ctx context.Context, roleID, permissionID int16) error {
+	if _, err := w.tx.Exec(ctx, insertRolePermissionQuery, roleID, permissionID); err != nil {
+		return fmt.Errorf("insert role_permission: %w", err)
+	}
+	return nil
 }
 
-// DeleteRolePermission unlinks a role from a permission.
-func (q *Queries) DeleteRolePermission(ctx context.Context, tx pgx.Tx, roleID, permissionID int16) error {
-	_, err := tx.Exec(ctx, deleteRolePermissionQuery, roleID, permissionID)
-	return err
+func (w txWriter) DeleteRolePermission(ctx context.Context, roleID, permissionID int16) error {
+	if _, err := w.tx.Exec(ctx, deleteRolePermissionQuery, roleID, permissionID); err != nil {
+		return fmt.Errorf("delete role_permission: %w", err)
+	}
+	return nil
 }
 
 // Ping checks database connectivity.
 func (q *Queries) Ping(ctx context.Context) error {
 	_, err := q.pool.Exec(ctx, "SELECT 1")
 	return err
-}
-
-// BeginTx starts a new transaction.
-func (q *Queries) BeginTx(ctx context.Context) (pgx.Tx, error) {
-	return q.pool.Begin(ctx)
 }

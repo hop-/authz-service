@@ -124,12 +124,16 @@ func main() {
 		}()
 	}
 
-	// 10. Setup health dependencies
-	api.HealthDeps.DB = queries
-	api.HealthDeps.Cache = redisCache
-	api.HealthDeps.Registry = reg
-	api.HealthDeps.Producer = prod
-	api.HealthDeps.AdminMode = cfg.AdminMode
+	// 10. Setup health checks
+	health := &api.HealthHandler{
+		DB:        queries,
+		Cache:     redisCache,
+		Registry:  reg,
+		AdminMode: cfg.AdminMode,
+	}
+	if prod != nil {
+		health.Kafka = prod
+	}
 
 	// Create admin handler
 	var adminHandler *api.AdminHandler
@@ -138,7 +142,7 @@ func main() {
 	}
 
 	// Create router
-	router := api.NewRouter(res, adminHandler, &cfg)
+	router := api.NewRouter(res, adminHandler, health, &cfg)
 
 	// Start HTTP server
 	httpAddr := fmt.Sprintf(":%d", cfg.HTTPPort)

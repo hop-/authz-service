@@ -37,6 +37,15 @@ GET  /query/v1/resources?user_id=<uuid>&action=read&resource_type=document
 POST /query/v1/resources/filter
 ```
 
+#### `GET /query/v1/permissions` semantics
+
+Returns the user's **effective** permissions: exactly the entries `/query/v1/check` would allow.
+
+- One entry per `(action, resource_type, resource_id)`, sorted by `resource_type`, `resource_id`, `action`. An empty result is `[]`.
+- A role grants a permission only on assignments whose `resource_type` matches the permission's resource type.
+- A key with an active `DENY` override is omitted. `DENY` entries are never returned.
+- `source` is `allow_override` for an active `ALLOW` override (it wins over roles, and carries the override's scope), otherwise `role:<name>`. When several roles grant the same key, the lexicographically smallest role name is reported.
+
 ### Admin (`ADMIN_MODE=true`, requires `X-Admin-Token` header)
 
 ```none
@@ -47,11 +56,20 @@ POST|DELETE      /admin/v1/users/{user_id}/roles
 POST|DELETE      /admin/v1/users/{user_id}/overrides
 ```
 
+Admin requests are validated before an event is published; invalid requests get `400 invalid_request` (or `404 unknown_role` / `unknown_permission`) instead of being dead-lettered by the worker:
+
+- JSON bodies are limited to 1 MiB.
+- `POST /users/{user_id}/roles` requires `resource_type`, `resource_id`, and `granted_by` (a UUID); `expires_at`, if set, must be in the future.
+- `POST /users/{user_id}/overrides` requires `resource_id`, `effect` (`ALLOW` or `DENY`, exactly), and `set_by` (a UUID); `expires_at`, if set, must be in the future.
+- `DELETE` of a user role or override returns 404 when the role or permission is not registered.
+
+**Re-assigning a role is a no-op.** Assigning an existing `(user, role, resource_type, resource_id)` again changes nothing. To change its scope or extend `expires_at`, revoke the assignment and assign it again.
+
 ### Health
 
 ```none
 GET /healthz   — liveness (always 200)
-GET /readyz    — readiness (checks DB, Redis, registry)
+GET /readyz    — readiness (checks DB, Redis, registry; Kafka in admin mode, passing when any broker is reachable)
 ```
 
 ### Swagger / OpenAPI
@@ -61,7 +79,7 @@ Auto-generated docs are served at `/swagger/index.html` when the API is running.
 To regenerate after code changes:
 
 ```bash
-swag init -g cmd/api/main.go -o docs/ --parseDependency --parseInternal
+go run github.com/swaggo/swag/cmd/swag@v1.16.6 init -g cmd/api/main.go -o docs/ --parseDependency --parseInternal
 ```
 
 The generated spec files live in `docs/` (`swagger.json`, `swagger.yaml`). These are committed so the API image serves them without needing the `swag` CLI at runtime.

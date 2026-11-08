@@ -90,8 +90,7 @@ func handleFilter(res *resolver.Resolver) http.HandlerFunc {
 			ResourceType string   `json:"resource_type"`
 			CandidateIDs []string `json:"candidate_ids"`
 		}
-		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-			writeError(w, http.StatusBadRequest, "invalid_request", "invalid JSON body")
+		if !decodeJSON(w, r, &body) {
 			return
 		}
 

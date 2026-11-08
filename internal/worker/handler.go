@@ -3,18 +3,25 @@ package worker
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"time"
 
-	"authz-service/internal/cache"
 	"authz-service/internal/db"
 	"authz-service/internal/model"
 	"authz-service/internal/producer"
 	"authz-service/internal/registry"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/segmentio/kafka-go"
+)
+
+// Retry policy, applied separately to the DB phase and to the follow-up phase.
+const (
+	maxRetries     = 5
+	initialBackoff = 100 * time.Millisecond
 )
 
 // EventEnvelope is the common envelope for all Kafka events.
@@ -24,28 +31,110 @@ type EventEnvelope struct {
 	OccurredAt time.Time `json:"occurred_at"`
 }
 
-type Handler struct {
-	db       *db.Queries
-	cache    *cache.Cache
-	registry *registry.Registry
-	producer *producer.Producer
-	workerID string
+// store is the worker's view of the primary database.
+type store interface {
+	ApplyEvent(ctx context.Context, eventID uuid.UUID, eventType string, fn func(db.Writer) error) (bool, error)
+	PermissionID(ctx context.Context, action, resourceType string) (int16, bool, error)
+	RoleID(ctx context.Context, name string) (int16, bool, error)
 }
 
-func NewHandler(q *db.Queries, c *cache.Cache, reg *registry.Registry, p *producer.Producer, workerID string) *Handler {
+// invalidator removes cached check results.
+type invalidator interface {
+	Invalidate(ctx context.Context, userID, resourceType, resourceID string) error
+	FlushAll(ctx context.Context) error
+}
+
+// publisher sends events to the main topic and to the dead-letter topic.
+type publisher interface {
+	Publish(ctx context.Context, key string, payload interface{}) error
+	PublishDLQ(ctx context.Context, originalEventID string, payload interface{}) error
+}
+
+type Handler struct {
+	store    store
+	cache    invalidator
+	registry *registry.Registry
+	producer publisher
+	workerID string
+	// sleep waits d between retries and returns ctx.Err() if ctx is done first.
+	// Tests replace it so retries run instantly.
+	sleep func(ctx context.Context, d time.Duration) error
+}
+
+func NewHandler(s store, c invalidator, reg *registry.Registry, p publisher, workerID string) *Handler {
 	return &Handler{
-		db:       q,
+		store:    s,
 		cache:    c,
 		registry: reg,
 		producer: p,
 		workerID: workerID,
+		sleep:    sleepContext,
 	}
 }
 
+func sleepContext(ctx context.Context, d time.Duration) error {
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-t.C:
+		return nil
+	}
+}
+
+// eventPlan is the prepared, validated form of one event.
+type eventPlan struct {
+	// apply runs inside store.ApplyEvent's transaction. nil means the event has no DB phase.
+	apply func(ctx context.Context, w db.Writer) error
+	// after runs the idempotent follow-ups (cache, registry, *.id.assigned publish).
+	// It runs on both the applied and the duplicate outcome; applied tells which.
+	after func(ctx context.Context, applied bool) error
+}
+
+// validationError marks an error caused by the event's content. Replaying the
+// same payload can never succeed, so it is permanent.
+type validationError struct{ err error }
+
+func (e *validationError) Error() string { return e.err.Error() }
+func (e *validationError) Unwrap() error { return e.err }
+
+func invalid(format string, args ...any) error {
+	return &validationError{err: fmt.Errorf(format, args...)}
+}
+
+// isPermanent reports whether err will fail again on replay of the same payload:
+// decode/validation errors, and PostgreSQL data exceptions (SQLSTATE class 22)
+// or integrity constraint violations (class 23). Everything else, class 42
+// included, is transient: a deploy can fix it, after which replay is correct.
+func isPermanent(err error) bool {
+	var vErr *validationError
+	if errors.As(err, &vErr) {
+		return true
+	}
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) && len(pgErr.Code) >= 2 {
+		switch pgErr.Code[:2] {
+		case "22", "23":
+			return true
+		}
+	}
+	return false
+}
+
+// Handle processes one message. It returns nil when the message is handled
+// (applied, duplicate, or routed to the DLQ) and a non-nil error only when
+// processing was aborted because ctx was cancelled; the caller must then not
+// commit the offset.
 func (h *Handler) Handle(ctx context.Context, msg kafka.Message) error {
 	var env EventEnvelope
 	if err := json.Unmarshal(msg.Value, &env); err != nil {
-		return h.sendToDLQ(ctx, msg, env, model.DLQReasonPermanent, err, 0)
+		return h.sendToDLQ(ctx, msg, env, model.DLQReasonPermanent, fmt.Errorf("decode envelope: %w", err), 0)
+	}
+
+	eventID, err := uuid.Parse(env.EventID)
+	if err != nil {
+		return h.sendToDLQ(ctx, msg, env, model.DLQReasonPermanent, fmt.Errorf("invalid event_id %q: %w", env.EventID, err), 0)
 	}
 
 	slog.Info("processing event",
@@ -53,86 +142,51 @@ func (h *Handler) Handle(ctx context.Context, msg kafka.Message) error {
 		"event_id", env.EventID,
 	)
 
-	var err error
-	switch env.Event {
-	case "role.assigned":
-		err = h.handleRoleAssigned(ctx, msg, env)
-	case "role.revoked":
-		err = h.handleRoleRevoked(ctx, msg, env)
-	case "override.set":
-		err = h.handleOverrideSet(ctx, msg, env)
-	case "override.removed":
-		err = h.handleOverrideRemoved(ctx, msg, env)
-	case "action.registered":
-		err = h.handleActionRegistered(ctx, msg, env)
-	case "action.removed":
-		err = h.handleActionRemoved(ctx, msg, env)
-	case "action.id.assigned":
-		err = h.handleActionIDAssigned(ctx, msg, env)
-	case "role.created":
-		err = h.handleRoleCreated(ctx, msg, env)
-	case "role.removed":
-		err = h.handleRoleRemoved(ctx, msg, env)
-	case "role.id.assigned":
-		err = h.handleRoleIDAssigned(ctx, msg, env)
-	case "role_permissions.assigned":
-		err = h.handleRolePermAssigned(ctx, msg, env)
-	case "role_permissions.removed":
-		err = h.handleRolePermRemoved(ctx, msg, env)
-	default:
-		return h.sendToDLQ(ctx, msg, env, model.DLQReasonPermanent, fmt.Errorf("unknown event type: %s", env.Event), 0)
+	plan, err := h.prepare(env, msg.Value)
+	if err != nil {
+		return h.sendToDLQ(ctx, msg, env, model.DLQReasonPermanent, err, 0)
 	}
 
-	return err
+	applied := false
+	if plan.apply != nil {
+		retries, err := h.retry(ctx, env, func(ctx context.Context) error {
+			ok, err := h.store.ApplyEvent(ctx, eventID, env.Event, func(w db.Writer) error {
+				return plan.apply(ctx, w)
+			})
+			applied = ok
+			return err
+		})
+		if err != nil {
+			return h.fail(ctx, msg, env, err, retries)
+		}
+		if !applied {
+			slog.Info("duplicate event, running follow-ups only", "event_id", env.EventID, "event_type", env.Event)
+		}
+	}
+
+	if plan.after != nil {
+		retries, err := h.retry(ctx, env, func(ctx context.Context) error {
+			return plan.after(ctx, applied)
+		})
+		if err != nil {
+			return h.fail(ctx, msg, env, err, retries)
+		}
+	}
+
+	return nil
 }
 
-func (h *Handler) withTransaction(ctx context.Context, msg kafka.Message, env EventEnvelope, fn func(ctx context.Context, tx interface {
-	Exec(ctx context.Context, sql string, args ...any) (interface{ RowsAffected() int64 }, error)
-}) error) error {
-	// Use retry with exponential backoff for transient errors
-	return h.withRetry(ctx, msg, env, func(ctx context.Context) error {
-		eventID, err := uuid.Parse(env.EventID)
-		if err != nil {
-			return fmt.Errorf("invalid event_id: %w", err)
-		}
-
-		tx, err := h.db.BeginTx(ctx)
-		if err != nil {
-			return err
-		}
-		defer tx.Rollback(ctx)
-
-		// Deduplication: insert event_id into event_log
-		isNew, err := h.db.InsertEventLog(ctx, tx, eventID, env.Event)
-		if err != nil {
-			return err
-		}
-		if !isNew {
-			slog.Info("duplicate event, skipping", "event_id", env.EventID, "event_type", env.Event)
-			return nil
-		}
-
-		// Execute the handler-specific logic
-		if err := fn(ctx, nil); err != nil {
-			return err
-		}
-
-		return tx.Commit(ctx)
-	})
-}
-
-func (h *Handler) withRetry(ctx context.Context, msg kafka.Message, env EventEnvelope, fn func(ctx context.Context) error) error {
-	maxRetries := 5
-	delay := 100 * time.Millisecond
-
-	for attempt := 0; attempt <= maxRetries; attempt++ {
-		err := fn(ctx)
+// retry runs op until it succeeds, fails permanently, ctx is done, or
+// maxRetries retries are used. It returns the number of retries made.
+func (h *Handler) retry(ctx context.Context, env EventEnvelope, op func(ctx context.Context) error) (int, error) {
+	delay := initialBackoff
+	for attempt := 0; ; attempt++ {
+		err := op(ctx)
 		if err == nil {
-			return nil
+			return attempt, nil
 		}
-
-		if attempt == maxRetries {
-			return h.sendToDLQ(ctx, msg, env, model.DLQReasonTransientExhausted, err, attempt)
+		if ctx.Err() != nil || isPermanent(err) || attempt == maxRetries {
+			return attempt, err
 		}
 
 		slog.Warn("transient error, retrying",
@@ -142,14 +196,28 @@ func (h *Handler) withRetry(ctx context.Context, msg kafka.Message, env EventEnv
 			"error", err,
 		)
 
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(delay):
-			delay *= 2
+		if err := h.sleep(ctx, delay); err != nil {
+			return attempt, err
 		}
+		delay *= 2
 	}
-	return nil
+}
+
+// fail routes a phase failure: abort without DLQ when ctx is done, otherwise
+// DLQ as permanent or transient_exhausted.
+func (h *Handler) fail(ctx context.Context, msg kafka.Message, env EventEnvelope, err error, retries int) error {
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		slog.Warn("event processing aborted",
+			"event_id", env.EventID,
+			"event_type", env.Event,
+			"error", err,
+		)
+		return ctxErr
+	}
+	if isPermanent(err) {
+		return h.sendToDLQ(ctx, msg, env, model.DLQReasonPermanent, err, retries)
+	}
+	return h.sendToDLQ(ctx, msg, env, model.DLQReasonTransientExhausted, err, retries)
 }
 
 func (h *Handler) sendToDLQ(ctx context.Context, msg kafka.Message, env EventEnvelope, reason model.DLQReason, originalErr error, retryCount int) error {
@@ -175,7 +243,10 @@ func (h *Handler) sendToDLQ(ctx context.Context, msg kafka.Message, env EventEnv
 
 	if err := h.producer.PublishDLQ(ctx, env.EventID, dlqMsg); err != nil {
 		// Best-effort: log the full DLQ message if publish fails
-		dlqJSON, _ := json.Marshal(dlqMsg)
+		dlqJSON, jsonErr := json.Marshal(dlqMsg)
+		if jsonErr != nil {
+			dlqJSON = []byte(fmt.Sprintf("<marshal failed: %v>", jsonErr))
+		}
 		slog.Error("failed to publish to DLQ",
 			"error", err,
 			"dlq_message", string(dlqJSON),
@@ -186,15 +257,97 @@ func (h *Handler) sendToDLQ(ctx context.Context, msg kafka.Message, env EventEnv
 		"event_id", env.EventID,
 		"event_type", env.Event,
 		"dlq_reason", reason,
+		"retry_count", retryCount,
 		"original_error", originalErr.Error(),
 	)
 
 	return nil // DLQ-routed messages are considered handled
 }
 
-// --- Per-event handlers ---
+// --- Prepare: decode, validate, resolve registry ids ---
 
-func (h *Handler) handleRoleAssigned(ctx context.Context, msg kafka.Message, env EventEnvelope) error {
+// prepare builds the plan for one event. Every error it returns is a
+// validationError, so it is permanent.
+func (h *Handler) prepare(env EventEnvelope, payload []byte) (eventPlan, error) {
+	switch env.Event {
+	case "role.assigned":
+		return h.prepareRoleAssigned(env, payload)
+	case "role.revoked":
+		return h.prepareRoleRevoked(payload)
+	case "override.set":
+		return h.prepareOverrideSet(env, payload)
+	case "override.removed":
+		return h.prepareOverrideRemoved(payload)
+	case "action.registered":
+		return h.prepareActionRegistered(payload)
+	case "action.removed":
+		return h.prepareActionRemoved(payload)
+	case "action.id.assigned":
+		return h.prepareActionIDAssigned(payload)
+	case "role.created":
+		return h.prepareRoleCreated(payload)
+	case "role.removed":
+		return h.prepareRoleRemoved(payload)
+	case "role.id.assigned":
+		return h.prepareRoleIDAssigned(payload)
+	case "role_permissions.assigned":
+		return h.prepareRolePermAssigned(payload)
+	case "role_permissions.removed":
+		return h.prepareRolePermRemoved(payload)
+	default:
+		return eventPlan{}, invalid("unknown event type: %s", env.Event)
+	}
+}
+
+func decodePayload(payload []byte, v any) error {
+	if err := json.Unmarshal(payload, v); err != nil {
+		return invalid("decode payload: %w", err)
+	}
+	return nil
+}
+
+func parseUUID(field, value string) (uuid.UUID, error) {
+	id, err := uuid.Parse(value)
+	if err != nil {
+		return uuid.Nil, invalid("invalid %s: %w", field, err)
+	}
+	return id, nil
+}
+
+func (h *Handler) resolveRole(name string) (int16, error) {
+	id, ok := h.registry.ResolveRole(name)
+	if !ok {
+		return 0, invalid("unknown role: %s", name)
+	}
+	return id, nil
+}
+
+func (h *Handler) resolvePermission(action, resourceType string) (int16, error) {
+	id, ok := h.registry.ResolvePermission(action, resourceType)
+	if !ok {
+		return 0, invalid("unknown permission: (%s, %s)", action, resourceType)
+	}
+	return id, nil
+}
+
+// invalidateAfter is the follow-up for per-user grant changes.
+func (h *Handler) invalidateAfter(userID uuid.UUID, resourceType, resourceID string) func(context.Context, bool) error {
+	return func(ctx context.Context, _ bool) error {
+		if err := h.cache.Invalidate(ctx, userID.String(), resourceType, resourceID); err != nil {
+			return fmt.Errorf("invalidate cache: %w", err)
+		}
+		return nil
+	}
+}
+
+func (h *Handler) flushAll(ctx context.Context) error {
+	if err := h.cache.FlushAll(ctx); err != nil {
+		return fmt.Errorf("flush cache: %w", err)
+	}
+	return nil
+}
+
+func (h *Handler) prepareRoleAssigned(env EventEnvelope, payload []byte) (eventPlan, error) {
 	var evt struct {
 		UserID       string            `json:"user_id"`
 		RoleName     string            `json:"role_name"`
@@ -204,103 +357,58 @@ func (h *Handler) handleRoleAssigned(ctx context.Context, msg kafka.Message, env
 		GrantedBy    string            `json:"granted_by"`
 		ExpiresAt    *time.Time        `json:"expires_at"`
 	}
-	if err := json.Unmarshal(msg.Value, &evt); err != nil {
-		return h.sendToDLQ(ctx, msg, env, model.DLQReasonPermanent, err, 0)
+	if err := decodePayload(payload, &evt); err != nil {
+		return eventPlan{}, err
 	}
-
-	userID, err := uuid.Parse(evt.UserID)
+	userID, err := parseUUID("user_id", evt.UserID)
 	if err != nil {
-		return h.sendToDLQ(ctx, msg, env, model.DLQReasonPermanent, fmt.Errorf("invalid user_id: %w", err), 0)
+		return eventPlan{}, err
 	}
-
-	roleID, ok := h.registry.ResolveRole(evt.RoleName)
-	if !ok {
-		return h.sendToDLQ(ctx, msg, env, model.DLQReasonPermanent, fmt.Errorf("unknown role: %s", evt.RoleName), 0)
-	}
-
-	grantedBy, err := uuid.Parse(evt.GrantedBy)
+	roleID, err := h.resolveRole(evt.RoleName)
 	if err != nil {
-		return h.sendToDLQ(ctx, msg, env, model.DLQReasonPermanent, fmt.Errorf("invalid granted_by: %w", err), 0)
+		return eventPlan{}, err
+	}
+	grantedBy, err := parseUUID("granted_by", evt.GrantedBy)
+	if err != nil {
+		return eventPlan{}, err
 	}
 
-	return h.withRetry(ctx, msg, env, func(ctx context.Context) error {
-		eventID, _ := uuid.Parse(env.EventID)
-		tx, err := h.db.BeginTx(ctx)
-		if err != nil {
-			return err
-		}
-		defer tx.Rollback(ctx)
-
-		isNew, err := h.db.InsertEventLog(ctx, tx, eventID, env.Event)
-		if err != nil {
-			return err
-		}
-		if !isNew {
-			return nil
-		}
-
-		if err := h.db.InsertUserRole(ctx, tx, userID, roleID, evt.ResourceType, evt.ResourceID, evt.Scope, grantedBy, env.OccurredAt, evt.ExpiresAt); err != nil {
-			return err
-		}
-
-		if err := tx.Commit(ctx); err != nil {
-			return err
-		}
-
-		return h.cache.Invalidate(ctx, userID.String(), evt.ResourceType, evt.ResourceID)
-	})
+	return eventPlan{
+		apply: func(ctx context.Context, w db.Writer) error {
+			return w.InsertUserRole(ctx, userID, roleID, evt.ResourceType, evt.ResourceID, evt.Scope, grantedBy, env.OccurredAt, evt.ExpiresAt)
+		},
+		after: h.invalidateAfter(userID, evt.ResourceType, evt.ResourceID),
+	}, nil
 }
 
-func (h *Handler) handleRoleRevoked(ctx context.Context, msg kafka.Message, env EventEnvelope) error {
+func (h *Handler) prepareRoleRevoked(payload []byte) (eventPlan, error) {
 	var evt struct {
 		UserID       string `json:"user_id"`
 		RoleName     string `json:"role_name"`
 		ResourceType string `json:"resource_type"`
 		ResourceID   string `json:"resource_id"`
 	}
-	if err := json.Unmarshal(msg.Value, &evt); err != nil {
-		return h.sendToDLQ(ctx, msg, env, model.DLQReasonPermanent, err, 0)
+	if err := decodePayload(payload, &evt); err != nil {
+		return eventPlan{}, err
 	}
-
-	userID, err := uuid.Parse(evt.UserID)
+	userID, err := parseUUID("user_id", evt.UserID)
 	if err != nil {
-		return h.sendToDLQ(ctx, msg, env, model.DLQReasonPermanent, fmt.Errorf("invalid user_id: %w", err), 0)
+		return eventPlan{}, err
+	}
+	roleID, err := h.resolveRole(evt.RoleName)
+	if err != nil {
+		return eventPlan{}, err
 	}
 
-	roleID, ok := h.registry.ResolveRole(evt.RoleName)
-	if !ok {
-		return h.sendToDLQ(ctx, msg, env, model.DLQReasonPermanent, fmt.Errorf("unknown role: %s", evt.RoleName), 0)
-	}
-
-	return h.withRetry(ctx, msg, env, func(ctx context.Context) error {
-		eventID, _ := uuid.Parse(env.EventID)
-		tx, err := h.db.BeginTx(ctx)
-		if err != nil {
-			return err
-		}
-		defer tx.Rollback(ctx)
-
-		isNew, err := h.db.InsertEventLog(ctx, tx, eventID, env.Event)
-		if err != nil {
-			return err
-		}
-		if !isNew {
-			return nil
-		}
-
-		if err := h.db.DeleteUserRole(ctx, tx, userID, roleID, evt.ResourceType, evt.ResourceID); err != nil {
-			return err
-		}
-
-		if err := tx.Commit(ctx); err != nil {
-			return err
-		}
-
-		return h.cache.Invalidate(ctx, userID.String(), evt.ResourceType, evt.ResourceID)
-	})
+	return eventPlan{
+		apply: func(ctx context.Context, w db.Writer) error {
+			return w.DeleteUserRole(ctx, userID, roleID, evt.ResourceType, evt.ResourceID)
+		},
+		after: h.invalidateAfter(userID, evt.ResourceType, evt.ResourceID),
+	}, nil
 }
 
-func (h *Handler) handleOverrideSet(ctx context.Context, msg kafka.Message, env EventEnvelope) error {
+func (h *Handler) prepareOverrideSet(env EventEnvelope, payload []byte) (eventPlan, error) {
 	var evt struct {
 		UserID       string            `json:"user_id"`
 		Action       string            `json:"action"`
@@ -312,392 +420,298 @@ func (h *Handler) handleOverrideSet(ctx context.Context, msg kafka.Message, env 
 		SetBy        string            `json:"set_by"`
 		ExpiresAt    *time.Time        `json:"expires_at"`
 	}
-	if err := json.Unmarshal(msg.Value, &evt); err != nil {
-		return h.sendToDLQ(ctx, msg, env, model.DLQReasonPermanent, err, 0)
+	if err := decodePayload(payload, &evt); err != nil {
+		return eventPlan{}, err
 	}
-
-	userID, err := uuid.Parse(evt.UserID)
+	userID, err := parseUUID("user_id", evt.UserID)
 	if err != nil {
-		return h.sendToDLQ(ctx, msg, env, model.DLQReasonPermanent, fmt.Errorf("invalid user_id: %w", err), 0)
+		return eventPlan{}, err
 	}
-
-	permID, ok := h.registry.ResolvePermission(evt.Action, evt.ResourceType)
-	if !ok {
-		return h.sendToDLQ(ctx, msg, env, model.DLQReasonPermanent, fmt.Errorf("unknown permission: (%s, %s)", evt.Action, evt.ResourceType), 0)
-	}
-
-	setBy, err := uuid.Parse(evt.SetBy)
+	permID, err := h.resolvePermission(evt.Action, evt.ResourceType)
 	if err != nil {
-		return h.sendToDLQ(ctx, msg, env, model.DLQReasonPermanent, fmt.Errorf("invalid set_by: %w", err), 0)
+		return eventPlan{}, err
+	}
+	setBy, err := parseUUID("set_by", evt.SetBy)
+	if err != nil {
+		return eventPlan{}, err
 	}
 
-	return h.withRetry(ctx, msg, env, func(ctx context.Context) error {
-		eventID, _ := uuid.Parse(env.EventID)
-		tx, err := h.db.BeginTx(ctx)
-		if err != nil {
-			return err
-		}
-		defer tx.Rollback(ctx)
-
-		isNew, err := h.db.InsertEventLog(ctx, tx, eventID, env.Event)
-		if err != nil {
-			return err
-		}
-		if !isNew {
-			return nil
-		}
-
-		if err := h.db.UpsertOverride(ctx, tx, userID, permID, evt.ResourceID, evt.Scope, model.Effect(evt.Effect), evt.Reason, setBy, env.OccurredAt, evt.ExpiresAt); err != nil {
-			return err
-		}
-
-		if err := tx.Commit(ctx); err != nil {
-			return err
-		}
-
-		return h.cache.Invalidate(ctx, userID.String(), evt.ResourceType, evt.ResourceID)
-	})
+	return eventPlan{
+		apply: func(ctx context.Context, w db.Writer) error {
+			return w.UpsertOverride(ctx, userID, permID, evt.ResourceID, evt.Scope, model.Effect(evt.Effect), evt.Reason, setBy, env.OccurredAt, evt.ExpiresAt)
+		},
+		after: h.invalidateAfter(userID, evt.ResourceType, evt.ResourceID),
+	}, nil
 }
 
-func (h *Handler) handleOverrideRemoved(ctx context.Context, msg kafka.Message, env EventEnvelope) error {
+func (h *Handler) prepareOverrideRemoved(payload []byte) (eventPlan, error) {
 	var evt struct {
 		UserID       string `json:"user_id"`
 		Action       string `json:"action"`
 		ResourceType string `json:"resource_type"`
 		ResourceID   string `json:"resource_id"`
 	}
-	if err := json.Unmarshal(msg.Value, &evt); err != nil {
-		return h.sendToDLQ(ctx, msg, env, model.DLQReasonPermanent, err, 0)
+	if err := decodePayload(payload, &evt); err != nil {
+		return eventPlan{}, err
 	}
-
-	userID, err := uuid.Parse(evt.UserID)
+	userID, err := parseUUID("user_id", evt.UserID)
 	if err != nil {
-		return h.sendToDLQ(ctx, msg, env, model.DLQReasonPermanent, fmt.Errorf("invalid user_id: %w", err), 0)
+		return eventPlan{}, err
+	}
+	permID, err := h.resolvePermission(evt.Action, evt.ResourceType)
+	if err != nil {
+		return eventPlan{}, err
 	}
 
-	permID, ok := h.registry.ResolvePermission(evt.Action, evt.ResourceType)
-	if !ok {
-		return h.sendToDLQ(ctx, msg, env, model.DLQReasonPermanent, fmt.Errorf("unknown permission: (%s, %s)", evt.Action, evt.ResourceType), 0)
-	}
-
-	return h.withRetry(ctx, msg, env, func(ctx context.Context) error {
-		eventID, _ := uuid.Parse(env.EventID)
-		tx, err := h.db.BeginTx(ctx)
-		if err != nil {
-			return err
-		}
-		defer tx.Rollback(ctx)
-
-		isNew, err := h.db.InsertEventLog(ctx, tx, eventID, env.Event)
-		if err != nil {
-			return err
-		}
-		if !isNew {
-			return nil
-		}
-
-		if err := h.db.DeleteOverride(ctx, tx, userID, permID, evt.ResourceID); err != nil {
-			return err
-		}
-
-		if err := tx.Commit(ctx); err != nil {
-			return err
-		}
-
-		return h.cache.Invalidate(ctx, userID.String(), evt.ResourceType, evt.ResourceID)
-	})
+	return eventPlan{
+		apply: func(ctx context.Context, w db.Writer) error {
+			return w.DeleteOverride(ctx, userID, permID, evt.ResourceID)
+		},
+		after: h.invalidateAfter(userID, evt.ResourceType, evt.ResourceID),
+	}, nil
 }
 
-func (h *Handler) handleActionRegistered(ctx context.Context, msg kafka.Message, env EventEnvelope) error {
+func (h *Handler) prepareActionRegistered(payload []byte) (eventPlan, error) {
 	var evt struct {
 		Action       string `json:"action"`
 		ResourceType string `json:"resource_type"`
 		Description  string `json:"description"`
 	}
-	if err := json.Unmarshal(msg.Value, &evt); err != nil {
-		return h.sendToDLQ(ctx, msg, env, model.DLQReasonPermanent, err, 0)
+	if err := decodePayload(payload, &evt); err != nil {
+		return eventPlan{}, err
 	}
 
-	return h.withRetry(ctx, msg, env, func(ctx context.Context) error {
-		eventID, _ := uuid.Parse(env.EventID)
-		tx, err := h.db.BeginTx(ctx)
-		if err != nil {
-			return err
-		}
-		defer tx.Rollback(ctx)
-
-		isNew, err := h.db.InsertEventLog(ctx, tx, eventID, env.Event)
-		if err != nil {
-			return err
-		}
-		if !isNew {
+	var insertedID int16
+	return eventPlan{
+		apply: func(ctx context.Context, w db.Writer) error {
+			id, err := w.InsertPermission(ctx, evt.Action, evt.ResourceType, evt.Description)
+			if err != nil {
+				return err
+			}
+			insertedID = id
 			return nil
-		}
+		},
+		after: func(ctx context.Context, applied bool) error {
+			id := insertedID
+			if !applied {
+				var found bool
+				var err error
+				id, found, err = h.lookupPermissionID(ctx, evt.Action, evt.ResourceType)
+				if err != nil {
+					return err
+				}
+				if !found {
+					slog.Info("permission no longer exists, skipping follow-ups",
+						"action", evt.Action, "resource_type", evt.ResourceType)
+					return nil
+				}
+			}
 
-		id, err := h.db.InsertPermission(ctx, tx, evt.Action, evt.ResourceType, evt.Description)
-		if err != nil {
-			return err
-		}
+			h.registry.AddPermission(evt.Action, evt.ResourceType, id)
 
-		if err := tx.Commit(ctx); err != nil {
-			return err
-		}
-
-		// Inline registry update
-		h.registry.AddPermission(evt.Action, evt.ResourceType, id)
-
-		// Publish action.id.assigned
-		idEvent := producer.NewEventEnvelope("action.id.assigned")
-		idEvent["action"] = evt.Action
-		idEvent["resource_type"] = evt.ResourceType
-		idEvent["id"] = id
-
-		return h.producer.Publish(ctx, "registry", idEvent)
-	})
+			idEvent := producer.NewEventEnvelope("action.id.assigned")
+			idEvent["action"] = evt.Action
+			idEvent["resource_type"] = evt.ResourceType
+			idEvent["id"] = id
+			if err := h.producer.Publish(ctx, "registry", idEvent); err != nil {
+				return fmt.Errorf("publish action.id.assigned: %w", err)
+			}
+			return nil
+		},
+	}, nil
 }
 
-func (h *Handler) handleActionRemoved(ctx context.Context, msg kafka.Message, env EventEnvelope) error {
+// lookupPermissionID resolves a permission id from the registry, falling back to the primary DB.
+func (h *Handler) lookupPermissionID(ctx context.Context, action, resourceType string) (int16, bool, error) {
+	if id, ok := h.registry.ResolvePermission(action, resourceType); ok {
+		return id, true, nil
+	}
+	id, found, err := h.store.PermissionID(ctx, action, resourceType)
+	if err != nil {
+		return 0, false, fmt.Errorf("lookup permission (%s, %s): %w", action, resourceType, err)
+	}
+	return id, found, nil
+}
+
+func (h *Handler) prepareActionRemoved(payload []byte) (eventPlan, error) {
 	var evt struct {
 		Action       string `json:"action"`
 		ResourceType string `json:"resource_type"`
 	}
-	if err := json.Unmarshal(msg.Value, &evt); err != nil {
-		return h.sendToDLQ(ctx, msg, env, model.DLQReasonPermanent, err, 0)
+	if err := decodePayload(payload, &evt); err != nil {
+		return eventPlan{}, err
 	}
 
-	return h.withRetry(ctx, msg, env, func(ctx context.Context) error {
-		eventID, _ := uuid.Parse(env.EventID)
-		tx, err := h.db.BeginTx(ctx)
-		if err != nil {
-			return err
-		}
-		defer tx.Rollback(ctx)
-
-		isNew, err := h.db.InsertEventLog(ctx, tx, eventID, env.Event)
-		if err != nil {
-			return err
-		}
-		if !isNew {
-			return nil
-		}
-
-		if err := h.db.DeletePermission(ctx, tx, evt.Action, evt.ResourceType); err != nil {
-			return err
-		}
-
-		if err := tx.Commit(ctx); err != nil {
-			return err
-		}
-
-		h.registry.RemovePermission(evt.Action, evt.ResourceType)
-		return h.cache.FlushAll(ctx)
-	})
+	return eventPlan{
+		apply: func(ctx context.Context, w db.Writer) error {
+			return w.DeletePermission(ctx, evt.Action, evt.ResourceType)
+		},
+		after: func(ctx context.Context, _ bool) error {
+			h.registry.RemovePermission(evt.Action, evt.ResourceType)
+			return h.flushAll(ctx)
+		},
+	}, nil
 }
 
-func (h *Handler) handleActionIDAssigned(ctx context.Context, msg kafka.Message, env EventEnvelope) error {
+func (h *Handler) prepareActionIDAssigned(payload []byte) (eventPlan, error) {
 	var evt struct {
 		Action       string `json:"action"`
 		ResourceType string `json:"resource_type"`
 		ID           int16  `json:"id"`
 	}
-	if err := json.Unmarshal(msg.Value, &evt); err != nil {
-		return h.sendToDLQ(ctx, msg, env, model.DLQReasonPermanent, err, 0)
+	if err := decodePayload(payload, &evt); err != nil {
+		return eventPlan{}, err
 	}
 
-	// Idempotent no-op if already present from inline update
-	h.registry.AddPermission(evt.Action, evt.ResourceType, evt.ID)
-	return nil
+	// No DB phase: the registry update is an idempotent no-op if already present.
+	return eventPlan{
+		after: func(context.Context, bool) error {
+			h.registry.AddPermission(evt.Action, evt.ResourceType, evt.ID)
+			return nil
+		},
+	}, nil
 }
 
-func (h *Handler) handleRoleCreated(ctx context.Context, msg kafka.Message, env EventEnvelope) error {
+func (h *Handler) prepareRoleCreated(payload []byte) (eventPlan, error) {
 	var evt struct {
 		RoleName    string `json:"role_name"`
 		Description string `json:"description"`
 	}
-	if err := json.Unmarshal(msg.Value, &evt); err != nil {
-		return h.sendToDLQ(ctx, msg, env, model.DLQReasonPermanent, err, 0)
+	if err := decodePayload(payload, &evt); err != nil {
+		return eventPlan{}, err
 	}
 
-	return h.withRetry(ctx, msg, env, func(ctx context.Context) error {
-		eventID, _ := uuid.Parse(env.EventID)
-		tx, err := h.db.BeginTx(ctx)
-		if err != nil {
-			return err
-		}
-		defer tx.Rollback(ctx)
-
-		isNew, err := h.db.InsertEventLog(ctx, tx, eventID, env.Event)
-		if err != nil {
-			return err
-		}
-		if !isNew {
+	var insertedID int16
+	return eventPlan{
+		apply: func(ctx context.Context, w db.Writer) error {
+			id, err := w.InsertRole(ctx, evt.RoleName, evt.Description)
+			if err != nil {
+				return err
+			}
+			insertedID = id
 			return nil
-		}
+		},
+		after: func(ctx context.Context, applied bool) error {
+			id := insertedID
+			if !applied {
+				var found bool
+				var err error
+				id, found, err = h.lookupRoleID(ctx, evt.RoleName)
+				if err != nil {
+					return err
+				}
+				if !found {
+					slog.Info("role no longer exists, skipping follow-ups", "role_name", evt.RoleName)
+					return nil
+				}
+			}
 
-		id, err := h.db.InsertRole(ctx, tx, evt.RoleName, evt.Description)
-		if err != nil {
-			return err
-		}
+			h.registry.AddRole(evt.RoleName, id)
 
-		if err := tx.Commit(ctx); err != nil {
-			return err
-		}
-
-		// Inline registry update
-		h.registry.AddRole(evt.RoleName, id)
-
-		// Publish role.id.assigned
-		idEvent := producer.NewEventEnvelope("role.id.assigned")
-		idEvent["role_name"] = evt.RoleName
-		idEvent["id"] = id
-
-		return h.producer.Publish(ctx, "registry", idEvent)
-	})
+			idEvent := producer.NewEventEnvelope("role.id.assigned")
+			idEvent["role_name"] = evt.RoleName
+			idEvent["id"] = id
+			if err := h.producer.Publish(ctx, "registry", idEvent); err != nil {
+				return fmt.Errorf("publish role.id.assigned: %w", err)
+			}
+			return nil
+		},
+	}, nil
 }
 
-func (h *Handler) handleRoleRemoved(ctx context.Context, msg kafka.Message, env EventEnvelope) error {
+// lookupRoleID resolves a role id from the registry, falling back to the primary DB.
+func (h *Handler) lookupRoleID(ctx context.Context, name string) (int16, bool, error) {
+	if id, ok := h.registry.ResolveRole(name); ok {
+		return id, true, nil
+	}
+	id, found, err := h.store.RoleID(ctx, name)
+	if err != nil {
+		return 0, false, fmt.Errorf("lookup role %s: %w", name, err)
+	}
+	return id, found, nil
+}
+
+func (h *Handler) prepareRoleRemoved(payload []byte) (eventPlan, error) {
 	var evt struct {
 		RoleName string `json:"role_name"`
 	}
-	if err := json.Unmarshal(msg.Value, &evt); err != nil {
-		return h.sendToDLQ(ctx, msg, env, model.DLQReasonPermanent, err, 0)
+	if err := decodePayload(payload, &evt); err != nil {
+		return eventPlan{}, err
 	}
 
-	return h.withRetry(ctx, msg, env, func(ctx context.Context) error {
-		eventID, _ := uuid.Parse(env.EventID)
-		tx, err := h.db.BeginTx(ctx)
-		if err != nil {
-			return err
-		}
-		defer tx.Rollback(ctx)
-
-		isNew, err := h.db.InsertEventLog(ctx, tx, eventID, env.Event)
-		if err != nil {
-			return err
-		}
-		if !isNew {
-			return nil
-		}
-
-		if err := h.db.DeleteRole(ctx, tx, evt.RoleName); err != nil {
-			return err
-		}
-
-		if err := tx.Commit(ctx); err != nil {
-			return err
-		}
-
-		h.registry.RemoveRole(evt.RoleName)
-		return h.cache.FlushAll(ctx)
-	})
+	return eventPlan{
+		apply: func(ctx context.Context, w db.Writer) error {
+			return w.DeleteRole(ctx, evt.RoleName)
+		},
+		after: func(ctx context.Context, _ bool) error {
+			h.registry.RemoveRole(evt.RoleName)
+			return h.flushAll(ctx)
+		},
+	}, nil
 }
 
-func (h *Handler) handleRoleIDAssigned(ctx context.Context, msg kafka.Message, env EventEnvelope) error {
+func (h *Handler) prepareRoleIDAssigned(payload []byte) (eventPlan, error) {
 	var evt struct {
 		RoleName string `json:"role_name"`
 		ID       int16  `json:"id"`
 	}
-	if err := json.Unmarshal(msg.Value, &evt); err != nil {
-		return h.sendToDLQ(ctx, msg, env, model.DLQReasonPermanent, err, 0)
+	if err := decodePayload(payload, &evt); err != nil {
+		return eventPlan{}, err
 	}
 
-	// Idempotent no-op if already present from inline update
-	h.registry.AddRole(evt.RoleName, evt.ID)
-	return nil
+	// No DB phase: the registry update is an idempotent no-op if already present.
+	return eventPlan{
+		after: func(context.Context, bool) error {
+			h.registry.AddRole(evt.RoleName, evt.ID)
+			return nil
+		},
+	}, nil
 }
 
-func (h *Handler) handleRolePermAssigned(ctx context.Context, msg kafka.Message, env EventEnvelope) error {
-	var evt struct {
-		RoleName     string `json:"role_name"`
-		Action       string `json:"action"`
-		ResourceType string `json:"resource_type"`
-	}
-	if err := json.Unmarshal(msg.Value, &evt); err != nil {
-		return h.sendToDLQ(ctx, msg, env, model.DLQReasonPermanent, err, 0)
-	}
-
-	roleID, ok := h.registry.ResolveRole(evt.RoleName)
-	if !ok {
-		return h.sendToDLQ(ctx, msg, env, model.DLQReasonPermanent, fmt.Errorf("unknown role: %s", evt.RoleName), 0)
-	}
-
-	permID, ok := h.registry.ResolvePermission(evt.Action, evt.ResourceType)
-	if !ok {
-		return h.sendToDLQ(ctx, msg, env, model.DLQReasonPermanent, fmt.Errorf("unknown permission: (%s, %s)", evt.Action, evt.ResourceType), 0)
-	}
-
-	return h.withRetry(ctx, msg, env, func(ctx context.Context) error {
-		eventID, _ := uuid.Parse(env.EventID)
-		tx, err := h.db.BeginTx(ctx)
-		if err != nil {
-			return err
-		}
-		defer tx.Rollback(ctx)
-
-		isNew, err := h.db.InsertEventLog(ctx, tx, eventID, env.Event)
-		if err != nil {
-			return err
-		}
-		if !isNew {
-			return nil
-		}
-
-		if err := h.db.InsertRolePermission(ctx, tx, roleID, permID); err != nil {
-			return err
-		}
-
-		if err := tx.Commit(ctx); err != nil {
-			return err
-		}
-
-		return h.cache.FlushAll(ctx)
-	})
+type rolePermEvent struct {
+	RoleName     string `json:"role_name"`
+	Action       string `json:"action"`
+	ResourceType string `json:"resource_type"`
 }
 
-func (h *Handler) handleRolePermRemoved(ctx context.Context, msg kafka.Message, env EventEnvelope) error {
-	var evt struct {
-		RoleName     string `json:"role_name"`
-		Action       string `json:"action"`
-		ResourceType string `json:"resource_type"`
+func (h *Handler) decodeRolePerm(payload []byte) (roleID, permID int16, err error) {
+	var evt rolePermEvent
+	if err := decodePayload(payload, &evt); err != nil {
+		return 0, 0, err
 	}
-	if err := json.Unmarshal(msg.Value, &evt); err != nil {
-		return h.sendToDLQ(ctx, msg, env, model.DLQReasonPermanent, err, 0)
+	roleID, err = h.resolveRole(evt.RoleName)
+	if err != nil {
+		return 0, 0, err
 	}
-
-	roleID, ok := h.registry.ResolveRole(evt.RoleName)
-	if !ok {
-		return h.sendToDLQ(ctx, msg, env, model.DLQReasonPermanent, fmt.Errorf("unknown role: %s", evt.RoleName), 0)
+	permID, err = h.resolvePermission(evt.Action, evt.ResourceType)
+	if err != nil {
+		return 0, 0, err
 	}
+	return roleID, permID, nil
+}
 
-	permID, ok := h.registry.ResolvePermission(evt.Action, evt.ResourceType)
-	if !ok {
-		return h.sendToDLQ(ctx, msg, env, model.DLQReasonPermanent, fmt.Errorf("unknown permission: (%s, %s)", evt.Action, evt.ResourceType), 0)
+func (h *Handler) prepareRolePermAssigned(payload []byte) (eventPlan, error) {
+	roleID, permID, err := h.decodeRolePerm(payload)
+	if err != nil {
+		return eventPlan{}, err
 	}
+	return eventPlan{
+		apply: func(ctx context.Context, w db.Writer) error {
+			return w.InsertRolePermission(ctx, roleID, permID)
+		},
+		after: func(ctx context.Context, _ bool) error { return h.flushAll(ctx) },
+	}, nil
+}
 
-	return h.withRetry(ctx, msg, env, func(ctx context.Context) error {
-		eventID, _ := uuid.Parse(env.EventID)
-		tx, err := h.db.BeginTx(ctx)
-		if err != nil {
-			return err
-		}
-		defer tx.Rollback(ctx)
-
-		isNew, err := h.db.InsertEventLog(ctx, tx, eventID, env.Event)
-		if err != nil {
-			return err
-		}
-		if !isNew {
-			return nil
-		}
-
-		if err := h.db.DeleteRolePermission(ctx, tx, roleID, permID); err != nil {
-			return err
-		}
-
-		if err := tx.Commit(ctx); err != nil {
-			return err
-		}
-
-		return h.cache.FlushAll(ctx)
-	})
+func (h *Handler) prepareRolePermRemoved(payload []byte) (eventPlan, error) {
+	roleID, permID, err := h.decodeRolePerm(payload)
+	if err != nil {
+		return eventPlan{}, err
+	}
+	return eventPlan{
+		apply: func(ctx context.Context, w db.Writer) error {
+			return w.DeleteRolePermission(ctx, roleID, permID)
+		},
+		after: func(ctx context.Context, _ bool) error { return h.flushAll(ctx) },
+	}, nil
 }

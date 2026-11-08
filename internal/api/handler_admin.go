@@ -1,11 +1,10 @@
 package api
 
 import (
-	"encoding/json"
+	"context"
 	"net/http"
 	"time"
 
-	"authz-service/internal/db"
 	"authz-service/internal/model"
 	"authz-service/internal/producer"
 	"authz-service/internal/registry"
@@ -14,14 +13,40 @@ import (
 	"github.com/google/uuid"
 )
 
-type AdminHandler struct {
-	db       *db.Queries
-	registry *registry.Registry
-	producer *producer.Producer
+// adminStore is the admin API's read-only view of the database.
+type adminStore interface {
+	ListAllPermissions(ctx context.Context) ([]model.Permission, error)
+	ListAllRoles(ctx context.Context) ([]model.Role, error)
+	ListRolePermissions(ctx context.Context, roleID int16) ([]model.Permission, error)
 }
 
-func NewAdminHandler(q *db.Queries, reg *registry.Registry, p *producer.Producer) *AdminHandler {
-	return &AdminHandler{db: q, registry: reg, producer: p}
+// publisher sends admin events to the main topic.
+type publisher interface {
+	Publish(ctx context.Context, key string, payload interface{}) error
+}
+
+type AdminHandler struct {
+	db       adminStore
+	registry *registry.Registry
+	producer publisher
+}
+
+func NewAdminHandler(s adminStore, reg *registry.Registry, p publisher) *AdminHandler {
+	return &AdminHandler{db: s, registry: reg, producer: p}
+}
+
+// parseActor parses a required actor UUID field (granted_by, set_by).
+func parseActor(value string) (uuid.UUID, bool) {
+	if value == "" {
+		return uuid.Nil, false
+	}
+	id, err := uuid.Parse(value)
+	return id, err == nil
+}
+
+// inFuture reports whether an optional expires_at is unset or after now.
+func inFuture(t *time.Time) bool {
+	return t == nil || t.After(time.Now())
 }
 
 // --- Action registry ---
@@ -65,8 +90,7 @@ func (h *AdminHandler) CreateAction(w http.ResponseWriter, r *http.Request) {
 		ResourceType string `json:"resource_type"`
 		Description  string `json:"description"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_request", "invalid JSON body")
+	if !decodeJSON(w, r, &body) {
 		return
 	}
 	if body.Action == "" || body.ResourceType == "" {
@@ -166,8 +190,7 @@ func (h *AdminHandler) CreateRole(w http.ResponseWriter, r *http.Request) {
 		Name        string `json:"name"`
 		Description string `json:"description"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_request", "invalid JSON body")
+	if !decodeJSON(w, r, &body) {
 		return
 	}
 	if body.Name == "" {
@@ -244,8 +267,11 @@ func (h *AdminHandler) AssignRolePermission(w http.ResponseWriter, r *http.Reque
 		Action       string `json:"action"`
 		ResourceType string `json:"resource_type"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_request", "invalid JSON body")
+	if !decodeJSON(w, r, &body) {
+		return
+	}
+	if body.Action == "" || body.ResourceType == "" {
+		writeError(w, http.StatusBadRequest, "invalid_request", "action and resource_type are required")
 		return
 	}
 
@@ -316,11 +342,13 @@ func (h *AdminHandler) RemoveRolePermission(w http.ResponseWriter, r *http.Reque
 
 // @Summary Assign role to user
 // @Description Assign a role to a user, scoped to a resource. Async — returns 202.
+// @Description granted_by is required and must be a UUID; expires_at, if set, must be in the future.
+// @Description Re-assigning an existing (user, role, resource_type, resource_id) is a no-op. To change scope or extend `expires_at`, revoke and assign again.
 // @Tags admin-user-roles
 // @Accept json
 // @Security AdminToken
 // @Param user_id path string true "User UUID"
-// @Param body body object true "Role assignment" SchemaExample({"role_name":"editor","resource_type":"project","resource_id":"proj-1"})
+// @Param body body object true "Role assignment" SchemaExample({"role_name":"editor","resource_type":"project","resource_id":"proj-1","granted_by":"00000000-0000-0000-0000-000000000001"})
 // @Success 202 "Accepted"
 // @Failure 400 {object} model.ErrorResponse
 // @Failure 401 {object} model.ErrorResponse
@@ -343,8 +371,20 @@ func (h *AdminHandler) AssignUserRole(w http.ResponseWriter, r *http.Request) {
 		GrantedBy    string            `json:"granted_by"`
 		ExpiresAt    *time.Time        `json:"expires_at"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_request", "invalid JSON body")
+	if !decodeJSON(w, r, &body) {
+		return
+	}
+	if body.ResourceType == "" || body.ResourceID == "" {
+		writeError(w, http.StatusBadRequest, "invalid_request", "resource_type and resource_id are required")
+		return
+	}
+	grantedBy, ok := parseActor(body.GrantedBy)
+	if !ok {
+		writeError(w, http.StatusBadRequest, "invalid_request", "granted_by is required and must be a valid UUID")
+		return
+	}
+	if !inFuture(body.ExpiresAt) {
+		writeError(w, http.StatusBadRequest, "invalid_request", "expires_at must be in the future")
 		return
 	}
 
@@ -359,7 +399,7 @@ func (h *AdminHandler) AssignUserRole(w http.ResponseWriter, r *http.Request) {
 	event["resource_type"] = body.ResourceType
 	event["resource_id"] = body.ResourceID
 	event["scope"] = body.Scope
-	event["granted_by"] = body.GrantedBy
+	event["granted_by"] = grantedBy.String()
 	if body.ExpiresAt != nil {
 		event["expires_at"] = body.ExpiresAt.Format(time.RFC3339)
 	} else {
@@ -385,6 +425,7 @@ func (h *AdminHandler) AssignUserRole(w http.ResponseWriter, r *http.Request) {
 // @Success 202 "Accepted"
 // @Failure 400 {object} model.ErrorResponse
 // @Failure 401 {object} model.ErrorResponse
+// @Failure 404 {object} model.ErrorResponse
 // @Failure 500 {object} model.ErrorResponse
 // @Router /admin/v1/users/{user_id}/roles/{role_name}/{resource_type}/{resource_id} [delete]
 func (h *AdminHandler) RevokeUserRole(w http.ResponseWriter, r *http.Request) {
@@ -398,6 +439,11 @@ func (h *AdminHandler) RevokeUserRole(w http.ResponseWriter, r *http.Request) {
 	roleName := chi.URLParam(r, "role_name")
 	resourceType := chi.URLParam(r, "resource_type")
 	resourceID := chi.URLParam(r, "resource_id")
+
+	if _, ok := h.registry.ResolveRole(roleName); !ok {
+		writeError(w, http.StatusNotFound, "unknown_role", "role "+roleName+" not found")
+		return
+	}
 
 	event := producer.NewEventEnvelope("role.revoked")
 	event["user_id"] = userID.String()
@@ -418,11 +464,12 @@ func (h *AdminHandler) RevokeUserRole(w http.ResponseWriter, r *http.Request) {
 
 // @Summary Set permission override
 // @Description Set an ALLOW or DENY override for a user on a specific resource. Async — returns 202.
+// @Description effect must be exactly ALLOW or DENY; set_by is required and must be a UUID; expires_at, if set, must be in the future.
 // @Tags admin-overrides
 // @Accept json
 // @Security AdminToken
 // @Param user_id path string true "User UUID"
-// @Param body body object true "Override definition" SchemaExample({"action":"write","resource_type":"project","resource_id":"proj-1","effect":"DENY","reason":"suspended"})
+// @Param body body object true "Override definition" SchemaExample({"action":"write","resource_type":"project","resource_id":"proj-1","effect":"DENY","reason":"suspended","set_by":"00000000-0000-0000-0000-000000000001"})
 // @Success 202 "Accepted"
 // @Failure 400 {object} model.ErrorResponse
 // @Failure 401 {object} model.ErrorResponse
@@ -447,8 +494,24 @@ func (h *AdminHandler) SetOverride(w http.ResponseWriter, r *http.Request) {
 		SetBy        string            `json:"set_by"`
 		ExpiresAt    *time.Time        `json:"expires_at"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_request", "invalid JSON body")
+	if !decodeJSON(w, r, &body) {
+		return
+	}
+	if body.ResourceID == "" {
+		writeError(w, http.StatusBadRequest, "invalid_request", "resource_id is required")
+		return
+	}
+	if effect := model.Effect(body.Effect); effect != model.EffectAllow && effect != model.EffectDeny {
+		writeError(w, http.StatusBadRequest, "invalid_request", "effect must be ALLOW or DENY")
+		return
+	}
+	setBy, ok := parseActor(body.SetBy)
+	if !ok {
+		writeError(w, http.StatusBadRequest, "invalid_request", "set_by is required and must be a valid UUID")
+		return
+	}
+	if !inFuture(body.ExpiresAt) {
+		writeError(w, http.StatusBadRequest, "invalid_request", "expires_at must be in the future")
 		return
 	}
 
@@ -465,7 +528,7 @@ func (h *AdminHandler) SetOverride(w http.ResponseWriter, r *http.Request) {
 	event["scope"] = body.Scope
 	event["effect"] = body.Effect
 	event["reason"] = body.Reason
-	event["set_by"] = body.SetBy
+	event["set_by"] = setBy.String()
 	if body.ExpiresAt != nil {
 		event["expires_at"] = body.ExpiresAt.Format(time.RFC3339)
 	} else {
@@ -491,6 +554,7 @@ func (h *AdminHandler) SetOverride(w http.ResponseWriter, r *http.Request) {
 // @Success 202 "Accepted"
 // @Failure 400 {object} model.ErrorResponse
 // @Failure 401 {object} model.ErrorResponse
+// @Failure 404 {object} model.ErrorResponse
 // @Failure 500 {object} model.ErrorResponse
 // @Router /admin/v1/users/{user_id}/overrides/{action}/{resource_type}/{resource_id} [delete]
 func (h *AdminHandler) RemoveOverride(w http.ResponseWriter, r *http.Request) {
@@ -504,6 +568,11 @@ func (h *AdminHandler) RemoveOverride(w http.ResponseWriter, r *http.Request) {
 	action := chi.URLParam(r, "action")
 	resourceType := chi.URLParam(r, "resource_type")
 	resourceID := chi.URLParam(r, "resource_id")
+
+	if _, ok := h.registry.ResolvePermission(action, resourceType); !ok {
+		writeError(w, http.StatusNotFound, "unknown_permission", "permission ("+action+", "+resourceType+") not found")
+		return
+	}
 
 	event := producer.NewEventEnvelope("override.removed")
 	event["user_id"] = userID.String()

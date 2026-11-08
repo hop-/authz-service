@@ -5,19 +5,22 @@ import (
 	"net/http"
 	"time"
 
-	"authz-service/internal/cache"
-	"authz-service/internal/db"
 	"authz-service/internal/model"
-	"authz-service/internal/producer"
 	"authz-service/internal/registry"
 )
 
-// HealthDeps holds dependencies for health checks.
-var HealthDeps struct {
-	DB        *db.Queries
-	Cache     *cache.Cache
-	Registry  *registry.Registry
-	Producer  *producer.Producer
+// pinger is a dependency whose connectivity readiness checks.
+type pinger interface {
+	Ping(ctx context.Context) error
+}
+
+// HealthHandler serves the liveness and readiness probes.
+type HealthHandler struct {
+	DB       pinger
+	Cache    pinger
+	Registry *registry.Registry
+	// Kafka is checked only in admin mode, where the API publishes events.
+	Kafka     pinger
 	AdminMode bool
 }
 
@@ -27,7 +30,7 @@ var HealthDeps struct {
 // @Produce json
 // @Success 200 {object} model.HealthResponse
 // @Router /healthz [get]
-func handleLiveness(w http.ResponseWriter, r *http.Request) {
+func (h *HealthHandler) Liveness(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, model.HealthResponse{Status: "ok"})
 }
 
@@ -38,13 +41,13 @@ func handleLiveness(w http.ResponseWriter, r *http.Request) {
 // @Success 200 {object} model.ReadinessResponse
 // @Failure 503 {object} model.ReadinessResponse
 // @Router /readyz [get]
-func handleReadiness(w http.ResponseWriter, r *http.Request) {
+func (h *HealthHandler) Readiness(w http.ResponseWriter, r *http.Request) {
 	checks := make(map[string]string)
 
 	// DB ping
 	ctx, cancel := context.WithTimeout(r.Context(), 1*time.Second)
 	defer cancel()
-	if err := HealthDeps.DB.Ping(ctx); err != nil {
+	if err := h.DB.Ping(ctx); err != nil {
 		checks["db"] = "failed: " + err.Error()
 	} else {
 		checks["db"] = "ok"
@@ -53,27 +56,31 @@ func handleReadiness(w http.ResponseWriter, r *http.Request) {
 	// Redis ping
 	ctx2, cancel2 := context.WithTimeout(r.Context(), 1*time.Second)
 	defer cancel2()
-	if err := HealthDeps.Cache.Ping(ctx2); err != nil {
+	if err := h.Cache.Ping(ctx2); err != nil {
 		checks["redis"] = "failed: " + err.Error()
 	} else {
 		checks["redis"] = "ok"
 	}
 
 	// Registry loaded
-	if HealthDeps.Registry.PermissionCount() == 0 {
+	if h.Registry.PermissionCount() == 0 {
 		checks["registry"] = "failed: no permissions loaded"
 	} else {
 		checks["registry"] = "ok"
 	}
 
 	// Kafka producer (AdminMode only)
-	if HealthDeps.AdminMode {
-		ctx3, cancel3 := context.WithTimeout(r.Context(), 1*time.Second)
-		defer cancel3()
-		if err := HealthDeps.Producer.Ping(ctx3); err != nil {
-			checks["kafka"] = "failed: " + err.Error()
+	if h.AdminMode {
+		if h.Kafka == nil {
+			checks["kafka"] = "failed: producer not configured"
 		} else {
-			checks["kafka"] = "ok"
+			ctx3, cancel3 := context.WithTimeout(r.Context(), 1*time.Second)
+			defer cancel3()
+			if err := h.Kafka.Ping(ctx3); err != nil {
+				checks["kafka"] = "failed: " + err.Error()
+			} else {
+				checks["kafka"] = "ok"
+			}
 		}
 	}
 

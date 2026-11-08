@@ -11,6 +11,10 @@ import (
 
 // @Summary List effective permissions
 // @Description List the effective permissions for a user, optionally filtered by resource type and resource ID.
+// @Description Returns exactly what /query/v1/check would allow: one entry per (action, resource_type, resource_id).
+// @Description Keys with an active DENY override are omitted (DENY entries are never returned).
+// @Description source is "allow_override" for an ALLOW override, otherwise "role:<name>" (the lexicographically smallest role name when several roles grant it).
+// @Description A role grants a permission only on assignments of the permission's resource type. Sorted by resource_type, resource_id, action.
 // @Tags query
 // @Produce json
 // @Param user_id query string true "User UUID"

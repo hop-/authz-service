@@ -90,15 +90,11 @@ func (r *Registry) AddPermission(action, resourceType string, id int16) {
 }
 
 // RemovePermission removes a permission from the live map.
+// Permission and role ids are separate sequences, so role names are never touched.
 func (r *Registry) RemovePermission(action, resourceType string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	key := permKey{action, resourceType}
-	id, ok := r.permissions[key]
-	if ok {
-		delete(r.roleNames, id)
-	}
-	delete(r.permissions, key)
+	delete(r.permissions, permKey{action, resourceType})
 }
 
 // AddRole adds a role to the live map.

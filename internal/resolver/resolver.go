@@ -1,24 +1,40 @@
 package resolver
 
 import (
+	"cmp"
 	"context"
+	"fmt"
+	"slices"
 
-	"authz-service/internal/cache"
-	"authz-service/internal/db"
 	"authz-service/internal/model"
 	"authz-service/internal/registry"
 
 	"github.com/google/uuid"
 )
 
+// checkCache caches single check results.
+type checkCache interface {
+	Get(ctx context.Context, req model.CheckRequest) (*model.CheckResult, error)
+	Set(ctx context.Context, req model.CheckRequest, result model.CheckResult) error
+}
+
+// store is the resolver's read-only view of the database.
+type store interface {
+	CheckOverride(ctx context.Context, userID uuid.UUID, permissionID int16, resourceID string) (*model.Effect, error)
+	CheckRole(ctx context.Context, userID uuid.UUID, permissionID int16, resourceType, resourceID string) (string, error)
+	Resources(ctx context.Context, userID uuid.UUID, permissionID int16, resourceType string, scopeFilter map[string]string) ([]string, error)
+	UserRoleGrants(ctx context.Context, userID uuid.UUID, resourceType, resourceID string) ([]model.RoleGrant, error)
+	UserOverrides(ctx context.Context, userID uuid.UUID, resourceType, resourceID string) ([]model.OverrideGrant, error)
+}
+
 type Resolver struct {
-	cache    *cache.Cache
-	db       *db.Queries
+	cache    checkCache
+	db       store
 	registry *registry.Registry
 }
 
-func NewResolver(c *cache.Cache, q *db.Queries, reg *registry.Registry) *Resolver {
-	return &Resolver{cache: c, db: q, registry: reg}
+func NewResolver(c checkCache, s store, reg *registry.Registry) *Resolver {
+	return &Resolver{cache: c, db: s, registry: reg}
 }
 
 // Check evaluates a single permission request.
@@ -72,9 +88,86 @@ func (r *Resolver) Check(ctx context.Context, req model.CheckRequest) (model.Che
 	return result, nil
 }
 
-// List returns all resolved permissions for a user, optionally filtered by resource.
+// List returns the user's effective permissions, the same set Check would
+// allow, optionally filtered by resource type, or by resource type and id.
+//
+// Entries are keyed by (action, resource_type, resource_id):
+//  1. an active DENY override excludes the key;
+//  2. otherwise an ALLOW override yields source "allow_override" with the override's scope;
+//  3. otherwise a role grant yields source "role:<name>", the lexicographically
+//     smallest role name winning when several roles grant the key.
+//
+// The result is sorted by resource_type, resource_id, action, and is never nil.
 func (r *Resolver) List(ctx context.Context, userID uuid.UUID, resourceType, resourceID string) ([]model.PermissionEntry, error) {
-	return r.db.ListUserPermissions(ctx, userID, resourceType, resourceID)
+	grants, err := r.db.UserRoleGrants(ctx, userID, resourceType, resourceID)
+	if err != nil {
+		return nil, fmt.Errorf("list role grants: %w", err)
+	}
+	overrides, err := r.db.UserOverrides(ctx, userID, resourceType, resourceID)
+	if err != nil {
+		return nil, fmt.Errorf("list overrides: %w", err)
+	}
+	return mergePermissions(grants, overrides), nil
+}
+
+type permissionKey struct {
+	action, resourceType, resourceID string
+}
+
+func mergePermissions(grants []model.RoleGrant, overrides []model.OverrideGrant) []model.PermissionEntry {
+	denied := make(map[permissionKey]struct{})
+	merged := make(map[permissionKey]model.PermissionEntry)
+
+	for _, o := range overrides {
+		k := permissionKey{o.Action, o.ResourceType, o.ResourceID}
+		switch o.Effect {
+		case model.EffectDeny:
+			denied[k] = struct{}{}
+		case model.EffectAllow:
+			merged[k] = model.PermissionEntry{
+				Action:       o.Action,
+				ResourceType: o.ResourceType,
+				ResourceID:   o.ResourceID,
+				Scope:        o.Scope,
+				Source:       "allow_override",
+			}
+		}
+	}
+
+	roleOf := make(map[permissionKey]string)
+	for _, g := range grants {
+		k := permissionKey{g.Action, g.ResourceType, g.ResourceID}
+		if e, ok := merged[k]; ok && e.Source == "allow_override" {
+			continue
+		}
+		if prev, ok := roleOf[k]; ok && prev <= g.RoleName {
+			continue
+		}
+		roleOf[k] = g.RoleName
+		merged[k] = model.PermissionEntry{
+			Action:       g.Action,
+			ResourceType: g.ResourceType,
+			ResourceID:   g.ResourceID,
+			Scope:        g.Scope,
+			Source:       "role:" + g.RoleName,
+		}
+	}
+
+	entries := make([]model.PermissionEntry, 0, len(merged))
+	for k, e := range merged {
+		if _, ok := denied[k]; ok {
+			continue
+		}
+		entries = append(entries, e)
+	}
+	slices.SortFunc(entries, func(a, b model.PermissionEntry) int {
+		return cmp.Or(
+			cmp.Compare(a.ResourceType, b.ResourceType),
+			cmp.Compare(a.ResourceID, b.ResourceID),
+			cmp.Compare(a.Action, b.Action),
+		)
+	})
+	return entries
 }
 
 // Resources returns all resource IDs where user has the given action.

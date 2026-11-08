@@ -3,6 +3,9 @@ package producer
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
+	"log/slog"
 	"strings"
 	"time"
 
@@ -12,12 +15,14 @@ import (
 
 type Producer struct {
 	writer   *kafka.Writer
+	brokers  []string
 	dlqTopic string
 }
 
 func NewProducer(brokers string, topic string) *Producer {
+	brokerList := strings.Split(brokers, ",")
 	w := &kafka.Writer{
-		Addr:         kafka.TCP(strings.Split(brokers, ",")...),
+		Addr:         kafka.TCP(brokerList...),
 		Topic:        topic,
 		Balancer:     &kafka.Hash{},
 		RequiredAcks: kafka.RequireAll,
@@ -25,6 +30,7 @@ func NewProducer(brokers string, topic string) *Producer {
 	}
 	return &Producer{
 		writer:   w,
+		brokers:  brokerList,
 		dlqTopic: topic + ".dlq",
 	}
 }
@@ -84,14 +90,26 @@ func NewEventEnvelope(eventType string) map[string]interface{} {
 	}
 }
 
-// Ping checks if at least one broker is reachable.
+// Ping checks if at least one broker is reachable. It dials each configured
+// broker in order and returns nil on the first success, otherwise the joined
+// dial errors of every broker.
 func (p *Producer) Ping(ctx context.Context) error {
-	// Attempt to resolve the leader for the topic as a connectivity check.
-	conn, err := kafka.DialContext(ctx, "tcp", p.writer.Addr.String())
-	if err != nil {
-		return err
+	errs := make([]error, 0, len(p.brokers))
+	for _, broker := range p.brokers {
+		conn, err := kafka.DialContext(ctx, "tcp", broker)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("dial %s: %w", broker, err))
+			continue
+		}
+		if err := conn.Close(); err != nil {
+			slog.Warn("closing kafka ping connection", "broker", broker, "error", err)
+		}
+		return nil
 	}
-	return conn.Close()
+	if len(errs) == 0 {
+		return errors.New("no kafka brokers configured")
+	}
+	return errors.Join(errs...)
 }
 
 // Close closes the underlying writer.
