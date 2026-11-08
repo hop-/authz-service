@@ -352,8 +352,9 @@ paths:
     post:
       consumes:
       - application/json
-      description: Set an ALLOW or DENY override for a user on a specific resource.
-        Async — returns 202.
+      description: |-
+        Set an ALLOW or DENY override for a user on a specific resource. Async — returns 202.
+        effect must be exactly ALLOW or DENY; set_by is required and must be a UUID; expires_at, if set, must be in the future.
       parameters:
       - description: User UUID
         in: path
@@ -426,6 +427,10 @@ paths:
           description: Unauthorized
           schema:
             $ref: '#/definitions/authz-service_internal_model.ErrorResponse'
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/authz-service_internal_model.ErrorResponse'
         "500":
           description: Internal Server Error
           schema:
@@ -439,8 +444,10 @@ paths:
     post:
       consumes:
       - application/json
-      description: Assign a role to a user, scoped to a resource. Async — returns
-        202.
+      description: |-
+        Assign a role to a user, scoped to a resource. Async — returns 202.
+        granted_by is required and must be a UUID; expires_at, if set, must be in the future.
+        Re-assigning an existing (user, role, resource_type, resource_id) is a no-op. To change scope or extend `expires_at`, revoke and assign again.
       parameters:
       - description: User UUID
         in: path
@@ -511,6 +518,10 @@ paths:
             $ref: '#/definitions/authz-service_internal_model.ErrorResponse'
         "401":
           description: Unauthorized
+          schema:
+            $ref: '#/definitions/authz-service_internal_model.ErrorResponse'
+        "404":
+          description: Not Found
           schema:
             $ref: '#/definitions/authz-service_internal_model.ErrorResponse'
         "500":
@@ -585,8 +596,12 @@ paths:
       - query
   /query/v1/permissions:
     get:
-      description: List the effective permissions for a user, optionally filtered
-        by resource type and resource ID.
+      description: |-
+        List the effective permissions for a user, optionally filtered by resource type and resource ID.
+        Returns exactly what /query/v1/check would allow: one entry per (action, resource_type, resource_id).
+        Keys with an active DENY override are omitted (DENY entries are never returned).
+        source is "allow_override" for an ALLOW override, otherwise "role:<name>" (the lexicographically smallest role name when several roles grant it).
+        A role grants a permission only on assignments of the permission's resource type. Sorted by resource_type, resource_id, action.
       parameters:
       - description: User UUID
         in: query

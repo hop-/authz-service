@@ -109,6 +109,25 @@ type PermissionEntry struct {
 	Source       string            `json:"source"`
 }
 
+// RoleGrant is a raw role-grant row for a user: the role grants Action on
+// (ResourceType, ResourceID). Internal; not serialized.
+type RoleGrant struct {
+	Action       string
+	ResourceType string
+	ResourceID   string
+	Scope        map[string]string
+	RoleName     string
+}
+
+// OverrideGrant is a raw override row (ALLOW or DENY) for a user. Internal; not serialized.
+type OverrideGrant struct {
+	Action       string
+	ResourceType string
+	ResourceID   string
+	Scope        map[string]string
+	Effect       Effect
+}
+
 // --- DLQ types ---
 
 type DLQReason string

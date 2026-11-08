@@ -431,7 +431,7 @@
                         "AdminToken": []
                     }
                 ],
-                "description": "Set an ALLOW or DENY override for a user on a specific resource. Async — returns 202.",
+                "description": "Set an ALLOW or DENY override for a user on a specific resource. Async — returns 202.\neffect must be exactly ALLOW or DENY; set_by is required and must be a UUID; expires_at, if set, must be in the future.",
                 "consumes": [
                     "application/json"
                 ],
@@ -546,6 +546,12 @@
                             "$ref": "#/definitions/authz-service_internal_model.ErrorResponse"
                         }
                     },
+                    "404": {
+                        "description": "Not Found",
+                        "schema": {
+                            "$ref": "#/definitions/authz-service_internal_model.ErrorResponse"
+                        }
+                    },
                     "500": {
                         "description": "Internal Server Error",
                         "schema": {
@@ -562,7 +568,7 @@
                         "AdminToken": []
                     }
                 ],
-                "description": "Assign a role to a user, scoped to a resource. Async — returns 202.",
+                "description": "Assign a role to a user, scoped to a resource. Async — returns 202.\ngranted_by is required and must be a UUID; expires_at, if set, must be in the future.\nRe-assigning an existing (user, role, resource_type, resource_id) is a no-op. To change scope or extend `expires_at`, revoke and assign again.",
                 "consumes": [
                     "application/json"
                 ],
@@ -677,6 +683,12 @@
                             "$ref": "#/definitions/authz-service_internal_model.ErrorResponse"
                         }
                     },
+                    "404": {
+                        "description": "Not Found",
+                        "schema": {
+                            "$ref": "#/definitions/authz-service_internal_model.ErrorResponse"
+                        }
+                    },
                     "500": {
                         "description": "Internal Server Error",
                         "schema": {
@@ -776,7 +788,7 @@
         },
         "/query/v1/permissions": {
             "get": {
-                "description": "List the effective permissions for a user, optionally filtered by resource type and resource ID.",
+                "description": "List the effective permissions for a user, optionally filtered by resource type and resource ID.\nReturns exactly what /query/v1/check would allow: one entry per (action, resource_type, resource_id).\nKeys with an active DENY override are omitted (DENY entries are never returned).\nsource is \"allow_override\" for an ALLOW override, otherwise \"role:\u003cname\u003e\" (the lexicographically smallest role name when several roles grant it).\nA role grants a permission only on assignments of the permission's resource type. Sorted by resource_type, resource_id, action.",
                 "produces": [
                     "application/json"
                 ],
