@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"slices"
+	"time"
 
 	"authz-service/internal/model"
 	"authz-service/internal/registry"
@@ -15,13 +16,17 @@ import (
 // checkCache caches single check results.
 type checkCache interface {
 	Get(ctx context.Context, req model.CheckRequest) (*model.CheckResult, error)
-	Set(ctx context.Context, req model.CheckRequest, result model.CheckResult) error
+	Set(ctx context.Context, req model.CheckRequest, result model.CheckResult, ttl time.Duration) error
 }
+
+// minCacheTTL is the shortest TTL worth caching. A result whose deciding grant
+// expires sooner is not cached.
+const minCacheTTL = time.Second
 
 // store is the resolver's read-only view of the database.
 type store interface {
-	CheckOverride(ctx context.Context, userID uuid.UUID, permissionID int16, resourceID string) (*model.Effect, error)
-	CheckRole(ctx context.Context, userID uuid.UUID, permissionID int16, resourceType, resourceID string) (string, error)
+	CheckOverride(ctx context.Context, userID uuid.UUID, permissionID int16, resourceID string) (*model.Effect, *time.Time, error)
+	CheckRole(ctx context.Context, userID uuid.UUID, permissionID int16, resourceType, resourceID string) (string, *time.Time, error)
 	Resources(ctx context.Context, userID uuid.UUID, permissionID int16, resourceType string, scopeFilter map[string]string) ([]string, error)
 	UserRoleGrants(ctx context.Context, userID uuid.UUID, resourceType, resourceID string) ([]model.RoleGrant, error)
 	UserOverrides(ctx context.Context, userID uuid.UUID, resourceType, resourceID string) ([]model.OverrideGrant, error)
@@ -31,10 +36,13 @@ type Resolver struct {
 	cache    checkCache
 	db       store
 	registry *registry.Registry
+	cacheTTL time.Duration
 }
 
-func NewResolver(c checkCache, s store, reg *registry.Registry) *Resolver {
-	return &Resolver{cache: c, db: s, registry: reg}
+// NewResolver creates a Resolver. cacheTTL is the longest a check result is
+// cached; results decided by an expiring grant are cached for less.
+func NewResolver(c checkCache, s store, reg *registry.Registry, cacheTTL time.Duration) *Resolver {
+	return &Resolver{cache: c, db: s, registry: reg, cacheTTL: cacheTTL}
 }
 
 // Check evaluates a single permission request.
@@ -54,7 +62,7 @@ func (r *Resolver) Check(ctx context.Context, req model.CheckRequest) (model.Che
 	var result model.CheckResult
 
 	// Step 2 & 3: override check
-	effect, err := r.db.CheckOverride(ctx, req.UserID, permID, req.ResourceID)
+	effect, overrideExpires, err := r.db.CheckOverride(ctx, req.UserID, permID, req.ResourceID)
 	if err != nil {
 		return model.CheckResult{}, err
 	}
@@ -62,30 +70,53 @@ func (r *Resolver) Check(ctx context.Context, req model.CheckRequest) (model.Che
 		switch *effect {
 		case model.EffectDeny:
 			result = model.CheckResult{Allowed: false, Source: "deny_override"}
-			_ = r.cache.Set(ctx, req, result)
+			r.cacheResult(ctx, req, result, r.ttlUntil(overrideExpires))
 			return result, nil
 		case model.EffectAllow:
 			result = model.CheckResult{Allowed: true, Source: "allow_override"}
-			_ = r.cache.Set(ctx, req, result)
+			r.cacheResult(ctx, req, result, r.ttlUntil(overrideExpires))
 			return result, nil
 		}
 	}
 
 	// Step 4: role expansion
-	roleName, err := r.db.CheckRole(ctx, req.UserID, permID, req.ResourceType, req.ResourceID)
+	roleName, roleExpires, err := r.db.CheckRole(ctx, req.UserID, permID, req.ResourceType, req.ResourceID)
 	if err != nil {
 		return model.CheckResult{}, err
 	}
 	if roleName != "" {
 		result = model.CheckResult{Allowed: true, Source: "role:" + roleName}
-		_ = r.cache.Set(ctx, req, result)
+		r.cacheResult(ctx, req, result, r.ttlUntil(roleExpires))
 		return result, nil
 	}
 
-	// Step 5: default deny
+	// Step 5: default deny (no grant decides it, so the TTL is not capped)
 	result = model.CheckResult{Allowed: false, Source: "default_deny"}
-	_ = r.cache.Set(ctx, req, result)
+	r.cacheResult(ctx, req, result, r.cacheTTL)
 	return result, nil
+}
+
+// ttlUntil caps the cache TTL at the remaining lifetime of the deciding grant;
+// expiresAt nil means the grant never expires.
+func (r *Resolver) ttlUntil(expiresAt *time.Time) time.Duration {
+	if expiresAt == nil {
+		return r.cacheTTL
+	}
+	return min(r.cacheTTL, time.Until(*expiresAt))
+}
+
+// cacheResult caches a check result for ttl, or not at all when ttl is under
+// minCacheTTL. A failed cache write only costs a later cache miss, so its
+// error is ignored.
+//
+// Known limitations (deferred, see README "Known limitations"): C6, a check
+// that read a lagging replica right after a change can cache the pre-change
+// result for up to the TTL; H7, invalidation scans all cached keys.
+func (r *Resolver) cacheResult(ctx context.Context, req model.CheckRequest, result model.CheckResult, ttl time.Duration) {
+	if ttl < minCacheTTL {
+		return
+	}
+	_ = r.cache.Set(ctx, req, result, ttl)
 }
 
 // List returns the user's effective permissions, the same set Check would

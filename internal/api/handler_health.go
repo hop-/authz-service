@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"net/http"
+	"strings"
 	"time"
 
 	"authz-service/internal/model"
@@ -14,14 +15,23 @@ type pinger interface {
 	Ping(ctx context.Context) error
 }
 
+// topicChecker reports which of the given Kafka topics don't exist.
+type topicChecker interface {
+	Missing(ctx context.Context, topics ...string) ([]string, error)
+}
+
 // HealthHandler serves the liveness and readiness probes.
 type HealthHandler struct {
 	DB       pinger
 	Cache    pinger
 	Registry *registry.Registry
 	// Kafka is checked only in admin mode, where the API publishes events.
-	Kafka     pinger
-	AdminMode bool
+	Kafka pinger
+	// Topics and KafkaTopic are checked in every mode: the registry syncer
+	// consumes KafkaTopic, and admin mode publishes to it.
+	Topics     topicChecker
+	KafkaTopic string
+	AdminMode  bool
 }
 
 // @Summary Liveness check
@@ -35,7 +45,7 @@ func (h *HealthHandler) Liveness(w http.ResponseWriter, r *http.Request) {
 }
 
 // @Summary Readiness check
-// @Description Checks DB, Redis, registry, and Kafka (if admin mode). Returns 503 if any check fails.
+// @Description Checks DB, Redis, registry, that the Kafka topic exists, and Kafka broker reachability (if admin mode). Returns 503 if any check fails.
 // @Tags health
 // @Produce json
 // @Success 200 {object} model.ReadinessResponse
@@ -67,6 +77,23 @@ func (h *HealthHandler) Readiness(w http.ResponseWriter, r *http.Request) {
 		checks["registry"] = "failed: no permissions loaded"
 	} else {
 		checks["registry"] = "ok"
+	}
+
+	// Kafka topic exists (all modes)
+	if h.Topics == nil {
+		checks["kafka_topics"] = "failed: topic check not configured"
+	} else {
+		ctx4, cancel4 := context.WithTimeout(r.Context(), 1*time.Second)
+		defer cancel4()
+		missing, err := h.Topics.Missing(ctx4, h.KafkaTopic)
+		switch {
+		case err != nil:
+			checks["kafka_topics"] = "failed: " + err.Error()
+		case len(missing) > 0:
+			checks["kafka_topics"] = "failed: missing " + strings.Join(missing, ", ")
+		default:
+			checks["kafka_topics"] = "ok"
+		}
 	}
 
 	// Kafka producer (AdminMode only)

@@ -7,6 +7,7 @@ import (
 	"reflect"
 	"slices"
 	"testing"
+	"time"
 
 	"authz-service/internal/cache"
 	"authz-service/internal/db"
@@ -30,6 +31,7 @@ type fakeCache struct {
 	setErr  error
 	gets    int
 	sets    []model.CheckResult
+	ttls    []time.Duration
 }
 
 func newFakeCache() *fakeCache {
@@ -48,8 +50,9 @@ func (c *fakeCache) Get(_ context.Context, req model.CheckRequest) (*model.Check
 	return &r, nil
 }
 
-func (c *fakeCache) Set(_ context.Context, req model.CheckRequest, result model.CheckResult) error {
+func (c *fakeCache) Set(_ context.Context, req model.CheckRequest, result model.CheckResult, ttl time.Duration) error {
 	c.sets = append(c.sets, result)
+	c.ttls = append(c.ttls, ttl)
 	if c.setErr != nil {
 		return c.setErr
 	}
@@ -70,10 +73,12 @@ type listCall struct {
 }
 
 type fakeStore struct {
-	overrideEffect *model.Effect
-	overrideErr    error
-	roleName       string
-	roleErr        error
+	overrideEffect  *model.Effect
+	overrideExpires *time.Time
+	overrideErr     error
+	roleName        string
+	roleExpires     *time.Time
+	roleErr         error
 
 	resourceIDs  []string
 	resourcesErr error
@@ -90,14 +95,14 @@ type fakeStore struct {
 	overrideLists  []listCall
 }
 
-func (s *fakeStore) CheckOverride(_ context.Context, _ uuid.UUID, _ int16, _ string) (*model.Effect, error) {
+func (s *fakeStore) CheckOverride(_ context.Context, _ uuid.UUID, _ int16, _ string) (*model.Effect, *time.Time, error) {
 	s.overrideCalls++
-	return s.overrideEffect, s.overrideErr
+	return s.overrideEffect, s.overrideExpires, s.overrideErr
 }
 
-func (s *fakeStore) CheckRole(_ context.Context, _ uuid.UUID, _ int16, _, _ string) (string, error) {
+func (s *fakeStore) CheckRole(_ context.Context, _ uuid.UUID, _ int16, _, _ string) (string, *time.Time, error) {
 	s.roleCalls++
-	return s.roleName, s.roleErr
+	return s.roleName, s.roleExpires, s.roleErr
 }
 
 func (s *fakeStore) Resources(_ context.Context, userID uuid.UUID, permissionID int16, resourceType string, scopeFilter map[string]string) ([]string, error) {
@@ -136,12 +141,20 @@ func newRegistry() *registry.Registry {
 
 func effect(e model.Effect) *model.Effect { return &e }
 
+// testTTL is the resolver's configured (maximum) cache TTL in tests.
+const testTTL = 5 * time.Minute
+
+func expiresIn(d time.Duration) *time.Time {
+	t := time.Now().Add(d)
+	return &t
+}
+
 // --- Check ---
 
 func TestCheck_UnknownPermission(t *testing.T) {
 	c := newFakeCache()
 	s := &fakeStore{}
-	res := NewResolver(c, s, registry.NewEmpty())
+	res := NewResolver(c, s, registry.NewEmpty(), testTTL)
 
 	_, err := res.Check(context.Background(), makeReq())
 	if !errors.Is(err, model.ErrUnknownPermission) {
@@ -157,7 +170,7 @@ func TestCheck_CacheHit(t *testing.T) {
 	req := makeReq()
 	c.entries[req] = model.CheckResult{Allowed: true, Source: "role:cached"}
 	s := &fakeStore{}
-	res := NewResolver(c, s, newRegistry())
+	res := NewResolver(c, s, newRegistry(), testTTL)
 
 	got, err := res.Check(context.Background(), req)
 	if err != nil {
@@ -212,7 +225,7 @@ func TestCheck_Resolution(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			c := newFakeCache()
-			res := NewResolver(c, tt.store, newRegistry())
+			res := NewResolver(c, tt.store, newRegistry(), testTTL)
 
 			got, err := res.Check(context.Background(), makeReq())
 			if err != nil {
@@ -231,11 +244,127 @@ func TestCheck_Resolution(t *testing.T) {
 	}
 }
 
+// TestCheck_CacheTTL covers H1: a cached result never outlives the grant that
+// decided it, and results with under a second left are not cached.
+func TestCheck_CacheTTL(t *testing.T) {
+	tests := []struct {
+		name   string
+		store  *fakeStore
+		want   model.CheckResult
+		cached bool
+		ttlMin time.Duration // inclusive bounds on the TTL passed to Set
+		ttlMax time.Duration
+	}{
+		{
+			name:   "deny override without expiry uses the configured TTL",
+			store:  &fakeStore{overrideEffect: effect(model.EffectDeny)},
+			want:   model.CheckResult{Allowed: false, Source: "deny_override"},
+			cached: true, ttlMin: testTTL, ttlMax: testTTL,
+		},
+		{
+			name:   "allow override expiring in 1m is capped",
+			store:  &fakeStore{overrideEffect: effect(model.EffectAllow), overrideExpires: expiresIn(time.Minute)},
+			want:   model.CheckResult{Allowed: true, Source: "allow_override"},
+			cached: true, ttlMin: 55 * time.Second, ttlMax: time.Minute,
+		},
+		{
+			name:   "deny override expiring in 30s is capped",
+			store:  &fakeStore{overrideEffect: effect(model.EffectDeny), overrideExpires: expiresIn(30 * time.Second)},
+			want:   model.CheckResult{Allowed: false, Source: "deny_override"},
+			cached: true, ttlMin: 25 * time.Second, ttlMax: 30 * time.Second,
+		},
+		{
+			name:   "override expiring after the TTL keeps the TTL",
+			store:  &fakeStore{overrideEffect: effect(model.EffectAllow), overrideExpires: expiresIn(time.Hour)},
+			want:   model.CheckResult{Allowed: true, Source: "allow_override"},
+			cached: true, ttlMin: testTTL, ttlMax: testTTL,
+		},
+		{
+			name:   "override with under 1s left is not cached",
+			store:  &fakeStore{overrideEffect: effect(model.EffectAllow), overrideExpires: expiresIn(900 * time.Millisecond)},
+			want:   model.CheckResult{Allowed: true, Source: "allow_override"},
+			cached: false,
+		},
+		{
+			name:   "role without expiry uses the configured TTL",
+			store:  &fakeStore{roleName: "editor"},
+			want:   model.CheckResult{Allowed: true, Source: "role:editor"},
+			cached: true, ttlMin: testTTL, ttlMax: testTTL,
+		},
+		{
+			name:   "role expiring in 3s is capped",
+			store:  &fakeStore{roleName: "editor", roleExpires: expiresIn(3 * time.Second)},
+			want:   model.CheckResult{Allowed: true, Source: "role:editor"},
+			cached: true, ttlMin: 2 * time.Second, ttlMax: 3 * time.Second,
+		},
+		{
+			name:   "role with under 1s left is not cached",
+			store:  &fakeStore{roleName: "editor", roleExpires: expiresIn(500 * time.Millisecond)},
+			want:   model.CheckResult{Allowed: true, Source: "role:editor"},
+			cached: false,
+		},
+		{
+			name:   "role that has just expired is not cached",
+			store:  &fakeStore{roleName: "editor", roleExpires: expiresIn(-time.Second)},
+			want:   model.CheckResult{Allowed: true, Source: "role:editor"},
+			cached: false,
+		},
+		{
+			name:   "default deny is not capped",
+			store:  &fakeStore{},
+			want:   model.CheckResult{Allowed: false, Source: "default_deny"},
+			cached: true, ttlMin: testTTL, ttlMax: testTTL,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c := newFakeCache()
+			res := NewResolver(c, tt.store, newRegistry(), testTTL)
+
+			got, err := res.Check(context.Background(), makeReq())
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got != tt.want {
+				t.Fatalf("got %+v, want %+v", got, tt.want)
+			}
+			if !tt.cached {
+				if len(c.sets) != 0 {
+					t.Fatalf("result must not be cached, got Set with ttl %v", c.ttls)
+				}
+				return
+			}
+			if len(c.sets) != 1 {
+				t.Fatalf("expected one cache write, got %d", len(c.sets))
+			}
+			if ttl := c.ttls[0]; ttl < tt.ttlMin || ttl > tt.ttlMax {
+				t.Fatalf("ttl = %v, want in [%v, %v]", ttl, tt.ttlMin, tt.ttlMax)
+			}
+		})
+	}
+}
+
+func TestCheck_SubSecondConfiguredTTLDisablesCaching(t *testing.T) {
+	c := newFakeCache()
+	res := NewResolver(c, &fakeStore{}, newRegistry(), 0)
+
+	got, err := res.Check(context.Background(), makeReq())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got != (model.CheckResult{Allowed: false, Source: "default_deny"}) {
+		t.Fatalf("got %+v", got)
+	}
+	if len(c.sets) != 0 {
+		t.Fatalf("a zero TTL must not be written (Redis would keep it forever), got ttls %v", c.ttls)
+	}
+}
+
 func TestCheck_CacheGetErrorFallsThroughToDB(t *testing.T) {
 	c := newFakeCache()
 	c.getErr = errors.New("redis down")
 	s := &fakeStore{roleName: "viewer"}
-	res := NewResolver(c, s, newRegistry())
+	res := NewResolver(c, s, newRegistry(), testTTL)
 
 	got, err := res.Check(context.Background(), makeReq())
 	if err != nil {
@@ -252,7 +381,7 @@ func TestCheck_CacheGetErrorFallsThroughToDB(t *testing.T) {
 func TestCheck_CacheSetErrorIgnored(t *testing.T) {
 	c := newFakeCache()
 	c.setErr = errors.New("redis down")
-	res := NewResolver(c, &fakeStore{overrideEffect: effect(model.EffectAllow)}, newRegistry())
+	res := NewResolver(c, &fakeStore{overrideEffect: effect(model.EffectAllow)}, newRegistry(), testTTL)
 
 	got, err := res.Check(context.Background(), makeReq())
 	if err != nil {
@@ -275,7 +404,7 @@ func TestCheck_DBErrorsReturned(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			c := newFakeCache()
-			res := NewResolver(c, tt.store, newRegistry())
+			res := NewResolver(c, tt.store, newRegistry(), testTTL)
 
 			got, err := res.Check(context.Background(), makeReq())
 			if !errors.Is(err, dbErr) {
@@ -407,7 +536,7 @@ func TestList_Merge(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			s := &fakeStore{grants: tt.grants, overrides: tt.overrides}
-			res := NewResolver(newFakeCache(), s, newRegistry())
+			res := NewResolver(newFakeCache(), s, newRegistry(), testTTL)
 
 			got, err := res.List(context.Background(), testUser, "", "")
 			if err != nil {
@@ -424,7 +553,7 @@ func TestList_Merge(t *testing.T) {
 }
 
 func TestList_EmptyResultSerializesAsArray(t *testing.T) {
-	res := NewResolver(newFakeCache(), &fakeStore{}, newRegistry())
+	res := NewResolver(newFakeCache(), &fakeStore{}, newRegistry(), testTTL)
 	got, err := res.List(context.Background(), testUser, "", "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -440,7 +569,7 @@ func TestList_EmptyResultSerializesAsArray(t *testing.T) {
 
 func TestList_PassesFilters(t *testing.T) {
 	s := &fakeStore{}
-	res := NewResolver(newFakeCache(), s, newRegistry())
+	res := NewResolver(newFakeCache(), s, newRegistry(), testTTL)
 
 	if _, err := res.List(context.Background(), testUser, "document", "d1"); err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -462,7 +591,7 @@ func TestList_StoreErrorsReturned(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			res := NewResolver(newFakeCache(), tt.store, newRegistry())
+			res := NewResolver(newFakeCache(), tt.store, newRegistry(), testTTL)
 			got, err := res.List(context.Background(), testUser, "", "")
 			if !errors.Is(err, dbErr) {
 				t.Fatalf("expected wrapped DB error, got %v", err)
@@ -479,7 +608,7 @@ func TestList_StoreErrorsReturned(t *testing.T) {
 func TestResources(t *testing.T) {
 	t.Run("unknown permission", func(t *testing.T) {
 		s := &fakeStore{}
-		res := NewResolver(newFakeCache(), s, registry.NewEmpty())
+		res := NewResolver(newFakeCache(), s, registry.NewEmpty(), testTTL)
 		_, err := res.Resources(context.Background(), model.ResourcesRequest{UserID: testUser, Action: "read", ResourceType: "document"})
 		if !errors.Is(err, model.ErrUnknownPermission) {
 			t.Fatalf("expected ErrUnknownPermission, got %v", err)
@@ -490,7 +619,7 @@ func TestResources(t *testing.T) {
 	})
 
 	t.Run("nil becomes empty slice", func(t *testing.T) {
-		res := NewResolver(newFakeCache(), &fakeStore{}, newRegistry())
+		res := NewResolver(newFakeCache(), &fakeStore{}, newRegistry(), testTTL)
 		got, err := res.Resources(context.Background(), model.ResourcesRequest{UserID: testUser, Action: "read", ResourceType: "document"})
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
@@ -502,7 +631,7 @@ func TestResources(t *testing.T) {
 
 	t.Run("passes permission id and scope filter", func(t *testing.T) {
 		s := &fakeStore{resourceIDs: []string{"d1", "d2"}}
-		res := NewResolver(newFakeCache(), s, newRegistry())
+		res := NewResolver(newFakeCache(), s, newRegistry(), testTTL)
 		scope := map[string]string{"team": "a"}
 		got, err := res.Resources(context.Background(), model.ResourcesRequest{UserID: testUser, Action: "read", ResourceType: "document", ScopeFilter: scope})
 		if err != nil {
@@ -519,7 +648,7 @@ func TestResources(t *testing.T) {
 
 	t.Run("db error", func(t *testing.T) {
 		dbErr := errors.New("db down")
-		res := NewResolver(newFakeCache(), &fakeStore{resourcesErr: dbErr}, newRegistry())
+		res := NewResolver(newFakeCache(), &fakeStore{resourcesErr: dbErr}, newRegistry(), testTTL)
 		_, err := res.Resources(context.Background(), model.ResourcesRequest{UserID: testUser, Action: "read", ResourceType: "document"})
 		if !errors.Is(err, dbErr) {
 			t.Fatalf("expected DB error, got %v", err)
@@ -529,7 +658,7 @@ func TestResources(t *testing.T) {
 
 func TestFilter(t *testing.T) {
 	t.Run("unknown permission", func(t *testing.T) {
-		res := NewResolver(newFakeCache(), &fakeStore{}, registry.NewEmpty())
+		res := NewResolver(newFakeCache(), &fakeStore{}, registry.NewEmpty(), testTTL)
 		_, err := res.Filter(context.Background(), testUser, "read", "document", []string{"d1"})
 		if !errors.Is(err, model.ErrUnknownPermission) {
 			t.Fatalf("expected ErrUnknownPermission, got %v", err)
@@ -538,7 +667,7 @@ func TestFilter(t *testing.T) {
 
 	t.Run("intersection keeps candidate order", func(t *testing.T) {
 		s := &fakeStore{resourceIDs: []string{"d3", "d1", "d9"}}
-		res := NewResolver(newFakeCache(), s, newRegistry())
+		res := NewResolver(newFakeCache(), s, newRegistry(), testTTL)
 		got, err := res.Filter(context.Background(), testUser, "read", "document", []string{"d1", "d2", "d3"})
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
@@ -552,7 +681,7 @@ func TestFilter(t *testing.T) {
 	})
 
 	t.Run("no match is an empty slice", func(t *testing.T) {
-		res := NewResolver(newFakeCache(), &fakeStore{resourceIDs: []string{"d9"}}, newRegistry())
+		res := NewResolver(newFakeCache(), &fakeStore{resourceIDs: []string{"d9"}}, newRegistry(), testTTL)
 		got, err := res.Filter(context.Background(), testUser, "read", "document", []string{"d1"})
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
@@ -564,7 +693,7 @@ func TestFilter(t *testing.T) {
 
 	t.Run("db error", func(t *testing.T) {
 		dbErr := errors.New("db down")
-		res := NewResolver(newFakeCache(), &fakeStore{resourcesErr: dbErr}, newRegistry())
+		res := NewResolver(newFakeCache(), &fakeStore{resourcesErr: dbErr}, newRegistry(), testTTL)
 		_, err := res.Filter(context.Background(), testUser, "read", "document", []string{"d1"})
 		if !errors.Is(err, dbErr) {
 			t.Fatalf("expected DB error, got %v", err)

@@ -22,6 +22,9 @@ type Config struct {
 	HTTPPort    int `goconfig:"application.port"`
 	MetricsPort int `goconfig:"application.metricsPort"`
 
+	// Registry config (api): how often the registry is reloaded from the DB
+	RegistryReloadSecs int `goconfig:"application.registry.reloadSecs"`
+
 	// Admin mode config
 	AdminMode  bool   `goconfig:"application.admin.enable"`
 	AdminToken string `goconfig:"application.admin.token,optional"`

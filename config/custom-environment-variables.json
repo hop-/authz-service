@@ -21,6 +21,9 @@
   "application": {
     "port": "HTTP_PORT",
     "metricsPort": "METRICS_PORT",
+    "registry": {
+      "reloadSecs": "REGISTRY_RELOAD_SECONDS"
+    },
     "admin": {
       "enable": "ADMIN_MODE",
       "token": "ADMIN_TOKEN"

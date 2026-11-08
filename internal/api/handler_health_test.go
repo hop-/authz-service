@@ -1,11 +1,13 @@
 package api
 
 import (
+	"context"
 	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"authz-service/internal/model"
 	"authz-service/internal/registry"
@@ -26,6 +28,7 @@ func readiness(t *testing.T, h *HealthHandler) (int, model.ReadinessResponse) {
 
 func TestReadiness(t *testing.T) {
 	down := fakePinger{err: errors.New("connection refused")}
+	topicsOK := func() *fakeTopics { return &fakeTopics{} }
 	tests := []struct {
 		name       string
 		handler    *HealthHandler
@@ -34,51 +37,75 @@ func TestReadiness(t *testing.T) {
 	}{
 		{
 			name:       "all ok",
-			handler:    &HealthHandler{DB: fakePinger{}, Cache: fakePinger{}, Registry: loadedRegistry()},
+			handler:    &HealthHandler{DB: fakePinger{}, Cache: fakePinger{}, Registry: loadedRegistry(), Topics: topicsOK(), KafkaTopic: testTopic},
 			wantStatus: http.StatusOK,
-			wantChecks: map[string]string{"db": "ok", "redis": "ok", "registry": "ok"},
+			wantChecks: map[string]string{"db": "ok", "redis": "ok", "registry": "ok", "kafka_topics": "ok"},
 		},
 		{
 			name:       "all ok in admin mode",
-			handler:    &HealthHandler{DB: fakePinger{}, Cache: fakePinger{}, Registry: loadedRegistry(), Kafka: fakePinger{}, AdminMode: true},
+			handler:    &HealthHandler{DB: fakePinger{}, Cache: fakePinger{}, Registry: loadedRegistry(), Kafka: fakePinger{}, Topics: topicsOK(), KafkaTopic: testTopic, AdminMode: true},
 			wantStatus: http.StatusOK,
-			wantChecks: map[string]string{"db": "ok", "redis": "ok", "registry": "ok", "kafka": "ok"},
+			wantChecks: map[string]string{"db": "ok", "redis": "ok", "registry": "ok", "kafka_topics": "ok", "kafka": "ok"},
 		},
 		{
 			name:       "db down",
-			handler:    &HealthHandler{DB: down, Cache: fakePinger{}, Registry: loadedRegistry()},
+			handler:    &HealthHandler{DB: down, Cache: fakePinger{}, Registry: loadedRegistry(), Topics: topicsOK(), KafkaTopic: testTopic},
 			wantStatus: http.StatusServiceUnavailable,
-			wantChecks: map[string]string{"db": "failed: connection refused", "redis": "ok", "registry": "ok"},
+			wantChecks: map[string]string{"db": "failed: connection refused", "redis": "ok", "registry": "ok", "kafka_topics": "ok"},
 		},
 		{
 			name:       "redis down",
-			handler:    &HealthHandler{DB: fakePinger{}, Cache: down, Registry: loadedRegistry()},
+			handler:    &HealthHandler{DB: fakePinger{}, Cache: down, Registry: loadedRegistry(), Topics: topicsOK(), KafkaTopic: testTopic},
 			wantStatus: http.StatusServiceUnavailable,
-			wantChecks: map[string]string{"db": "ok", "redis": "failed: connection refused", "registry": "ok"},
+			wantChecks: map[string]string{"db": "ok", "redis": "failed: connection refused", "registry": "ok", "kafka_topics": "ok"},
 		},
 		{
 			name:       "registry empty",
-			handler:    &HealthHandler{DB: fakePinger{}, Cache: fakePinger{}, Registry: registry.NewEmpty()},
+			handler:    &HealthHandler{DB: fakePinger{}, Cache: fakePinger{}, Registry: registry.NewEmpty(), Topics: topicsOK(), KafkaTopic: testTopic},
 			wantStatus: http.StatusServiceUnavailable,
-			wantChecks: map[string]string{"db": "ok", "redis": "ok", "registry": "failed: no permissions loaded"},
+			wantChecks: map[string]string{"db": "ok", "redis": "ok", "registry": "failed: no permissions loaded", "kafka_topics": "ok"},
 		},
 		{
 			name:       "kafka down in admin mode",
-			handler:    &HealthHandler{DB: fakePinger{}, Cache: fakePinger{}, Registry: loadedRegistry(), Kafka: down, AdminMode: true},
+			handler:    &HealthHandler{DB: fakePinger{}, Cache: fakePinger{}, Registry: loadedRegistry(), Kafka: down, Topics: topicsOK(), KafkaTopic: testTopic, AdminMode: true},
 			wantStatus: http.StatusServiceUnavailable,
-			wantChecks: map[string]string{"db": "ok", "redis": "ok", "registry": "ok", "kafka": "failed: connection refused"},
+			wantChecks: map[string]string{"db": "ok", "redis": "ok", "registry": "ok", "kafka_topics": "ok", "kafka": "failed: connection refused"},
 		},
 		{
 			name:       "kafka missing in admin mode",
-			handler:    &HealthHandler{DB: fakePinger{}, Cache: fakePinger{}, Registry: loadedRegistry(), AdminMode: true},
+			handler:    &HealthHandler{DB: fakePinger{}, Cache: fakePinger{}, Registry: loadedRegistry(), Topics: topicsOK(), KafkaTopic: testTopic, AdminMode: true},
 			wantStatus: http.StatusServiceUnavailable,
-			wantChecks: map[string]string{"db": "ok", "redis": "ok", "registry": "ok", "kafka": "failed: producer not configured"},
+			wantChecks: map[string]string{"db": "ok", "redis": "ok", "registry": "ok", "kafka_topics": "ok", "kafka": "failed: producer not configured"},
 		},
 		{
 			name:       "kafka ignored outside admin mode",
-			handler:    &HealthHandler{DB: fakePinger{}, Cache: fakePinger{}, Registry: loadedRegistry(), Kafka: down},
+			handler:    &HealthHandler{DB: fakePinger{}, Cache: fakePinger{}, Registry: loadedRegistry(), Kafka: down, Topics: topicsOK(), KafkaTopic: testTopic},
 			wantStatus: http.StatusOK,
-			wantChecks: map[string]string{"db": "ok", "redis": "ok", "registry": "ok"},
+			wantChecks: map[string]string{"db": "ok", "redis": "ok", "registry": "ok", "kafka_topics": "ok"},
+		},
+		{
+			name:       "topic missing",
+			handler:    &HealthHandler{DB: fakePinger{}, Cache: fakePinger{}, Registry: loadedRegistry(), Topics: &fakeTopics{missing: []string{testTopic}}, KafkaTopic: testTopic},
+			wantStatus: http.StatusServiceUnavailable,
+			wantChecks: map[string]string{"db": "ok", "redis": "ok", "registry": "ok", "kafka_topics": "failed: missing " + testTopic},
+		},
+		{
+			name:       "topic missing in admin mode",
+			handler:    &HealthHandler{DB: fakePinger{}, Cache: fakePinger{}, Registry: loadedRegistry(), Kafka: fakePinger{}, Topics: &fakeTopics{missing: []string{testTopic}}, KafkaTopic: testTopic, AdminMode: true},
+			wantStatus: http.StatusServiceUnavailable,
+			wantChecks: map[string]string{"db": "ok", "redis": "ok", "registry": "ok", "kafka_topics": "failed: missing " + testTopic, "kafka": "ok"},
+		},
+		{
+			name:       "topic check error",
+			handler:    &HealthHandler{DB: fakePinger{}, Cache: fakePinger{}, Registry: loadedRegistry(), Topics: &fakeTopics{err: errors.New("kafka metadata: dial tcp: refused")}, KafkaTopic: testTopic},
+			wantStatus: http.StatusServiceUnavailable,
+			wantChecks: map[string]string{"db": "ok", "redis": "ok", "registry": "ok", "kafka_topics": "failed: kafka metadata: dial tcp: refused"},
+		},
+		{
+			name:       "topic check not configured",
+			handler:    &HealthHandler{DB: fakePinger{}, Cache: fakePinger{}, Registry: loadedRegistry(), KafkaTopic: testTopic},
+			wantStatus: http.StatusServiceUnavailable,
+			wantChecks: map[string]string{"db": "ok", "redis": "ok", "registry": "ok", "kafka_topics": "failed: topic check not configured"},
 		},
 	}
 	for _, tt := range tests {
@@ -102,8 +129,40 @@ func TestReadiness(t *testing.T) {
 					t.Errorf("checks[%s] = %q, want %q", k, got, v)
 				}
 			}
+			if ft, ok := tt.handler.Topics.(*fakeTopics); ok {
+				if len(ft.asked) != 1 || ft.asked[0] != testTopic {
+					t.Errorf("topic check asked for %v, want [%s]", ft.asked, testTopic)
+				}
+			}
 		})
 	}
+}
+
+func TestReadiness_TopicCheckHasTimeout(t *testing.T) {
+	var deadline time.Time
+	var hasDeadline bool
+	topics := topicCheckerFunc(func(ctx context.Context, _ ...string) ([]string, error) {
+		deadline, hasDeadline = ctx.Deadline()
+		return nil, nil
+	})
+	h := &HealthHandler{DB: fakePinger{}, Cache: fakePinger{}, Registry: loadedRegistry(), Topics: topics, KafkaTopic: testTopic}
+
+	start := time.Now()
+	if status, resp := readiness(t, h); status != http.StatusOK {
+		t.Fatalf("status = %d (%+v)", status, resp)
+	}
+	if !hasDeadline {
+		t.Fatal("topic check ran without a deadline")
+	}
+	if d := deadline.Sub(start); d <= 0 || d > 1100*time.Millisecond {
+		t.Fatalf("topic check deadline %v after start, want about 1s", d)
+	}
+}
+
+type topicCheckerFunc func(ctx context.Context, topics ...string) ([]string, error)
+
+func (f topicCheckerFunc) Missing(ctx context.Context, topics ...string) ([]string, error) {
+	return f(ctx, topics...)
 }
 
 func TestLiveness(t *testing.T) {

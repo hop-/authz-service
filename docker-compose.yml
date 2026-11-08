@@ -50,7 +50,8 @@ services:
       KAFKA_ADVERTISED_LISTENERS: "PLAINTEXT://kafka:9094,PLAINTEXT_HOST://localhost:9092"
       KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
       # Kafka other configuration
-      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      # Topics are provisioned (kafka-init here, infra in production), never auto-created
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
       KAFKA_LOG4J_ROOT_LOGLEVEL: INFO
       KAFKA_LOG4J_LOGGERS: "kafka.controller=ERROR,kafka.producer.async.DefaultEventHandler=ERROR,state.change.logger=ERROR"
@@ -63,6 +64,23 @@ services:
       start_period: 10s
     volumes:
       - kafka-data:/var/lib/kafka/data
+
+  # Creates the service topics, as infra does in production. The services
+  # never create topics; they wait for them.
+  kafka-init:
+    image: confluentinc/cp-kafka:7.9.1
+    logging: *default-logging
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -e
+        for topic in authz.permission-events authz.permission-events.dlq; do
+          kafka-topics --bootstrap-server kafka:9094 --create --if-not-exists \
+            --topic "$$topic" --partitions 3 --replication-factor 1
+        done
+    depends_on:
+      kafka:
+        condition: service_healthy
 
   kafbat:
     logging: *default-logging
@@ -134,6 +152,8 @@ services:
         condition: service_completed_successfully
       kafka:
         condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
       redis:
         condition: service_healthy
 
@@ -154,6 +174,8 @@ services:
         condition: service_completed_successfully
       kafka:
         condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
       redis:
         condition: service_healthy
 

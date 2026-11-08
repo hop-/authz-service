@@ -11,10 +11,12 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"authz-service/internal/cache"
 	"authz-service/internal/config"
 	"authz-service/internal/db"
+	"authz-service/internal/kafkatopics"
 	"authz-service/internal/model"
 	"authz-service/internal/producer"
 	"authz-service/internal/registry"
@@ -25,11 +27,12 @@ import (
 
 // The production types must satisfy the api's consumer-side interfaces.
 var (
-	_ adminStore = (*db.Queries)(nil)
-	_ publisher  = (*producer.Producer)(nil)
-	_ pinger     = (*db.Queries)(nil)
-	_ pinger     = (*cache.Cache)(nil)
-	_ pinger     = (*producer.Producer)(nil)
+	_ adminStore   = (*db.Queries)(nil)
+	_ publisher    = (*producer.Producer)(nil)
+	_ pinger       = (*db.Queries)(nil)
+	_ pinger       = (*cache.Cache)(nil)
+	_ pinger       = (*producer.Producer)(nil)
+	_ topicChecker = kafkatopics.Checker{}
 )
 
 func TestMain(m *testing.M) {
@@ -87,7 +90,7 @@ func (fakeCheckCache) Get(context.Context, model.CheckRequest) (*model.CheckResu
 	return nil, nil
 }
 
-func (fakeCheckCache) Set(context.Context, model.CheckRequest, model.CheckResult) error {
+func (fakeCheckCache) Set(context.Context, model.CheckRequest, model.CheckResult, time.Duration) error {
 	return nil
 }
 
@@ -99,12 +102,12 @@ type fakeResolverStore struct {
 	err         error
 }
 
-func (s *fakeResolverStore) CheckOverride(context.Context, uuid.UUID, int16, string) (*model.Effect, error) {
-	return nil, s.err
+func (s *fakeResolverStore) CheckOverride(context.Context, uuid.UUID, int16, string) (*model.Effect, *time.Time, error) {
+	return nil, nil, s.err
 }
 
-func (s *fakeResolverStore) CheckRole(context.Context, uuid.UUID, int16, string, string) (string, error) {
-	return s.roleName, s.err
+func (s *fakeResolverStore) CheckRole(context.Context, uuid.UUID, int16, string, string) (string, *time.Time, error) {
+	return s.roleName, nil, s.err
 }
 
 func (s *fakeResolverStore) Resources(context.Context, uuid.UUID, int16, string, map[string]string) ([]string, error) {
@@ -124,6 +127,20 @@ func (s *fakeResolverStore) UserOverrides(context.Context, uuid.UUID, string, st
 type fakePinger struct{ err error }
 
 func (p fakePinger) Ping(context.Context) error { return p.err }
+
+// fakeTopics reports the topics in missing as absent, or fails with err.
+type fakeTopics struct {
+	missing []string
+	err     error
+	asked   []string
+}
+
+func (f *fakeTopics) Missing(_ context.Context, topics ...string) ([]string, error) {
+	f.asked = append(f.asked, topics...)
+	return f.missing, f.err
+}
+
+const testTopic = "authz.permission-events"
 
 // --- Server ---
 
@@ -149,9 +166,10 @@ func newTestServer(t *testing.T) *testServer {
 		pub:    &fakePublisher{},
 		rstore: &fakeResolverStore{},
 	}
-	res := resolver.NewResolver(fakeCheckCache{}, ts.rstore, reg)
+	res := resolver.NewResolver(fakeCheckCache{}, ts.rstore, reg, time.Minute)
 	admin := NewAdminHandler(ts.store, reg, ts.pub)
-	health := &HealthHandler{DB: fakePinger{}, Cache: fakePinger{}, Registry: reg}
+	health := &HealthHandler{DB: fakePinger{}, Cache: fakePinger{}, Registry: reg,
+		Kafka: fakePinger{}, Topics: &fakeTopics{}, KafkaTopic: testTopic, AdminMode: true}
 	cfg := &config.Config{AdminMode: true, AdminToken: adminToken}
 	ts.handler = NewRouter(res, admin, health, cfg)
 	return ts
@@ -162,8 +180,9 @@ func newTestServer(t *testing.T) *testServer {
 func newQueryOnlyServer(t *testing.T) *testServer {
 	t.Helper()
 	ts := newTestServer(t)
-	res := resolver.NewResolver(fakeCheckCache{}, ts.rstore, ts.reg)
-	health := &HealthHandler{DB: fakePinger{}, Cache: fakePinger{}, Registry: ts.reg}
+	res := resolver.NewResolver(fakeCheckCache{}, ts.rstore, ts.reg, time.Minute)
+	health := &HealthHandler{DB: fakePinger{}, Cache: fakePinger{}, Registry: ts.reg,
+		Topics: &fakeTopics{}, KafkaTopic: testTopic}
 	ts.handler = NewRouter(res, nil, health, &config.Config{})
 	return ts
 }

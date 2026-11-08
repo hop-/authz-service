@@ -15,8 +15,8 @@ import (
 	"authz-service/internal/cache"
 	"authz-service/internal/config"
 	"authz-service/internal/db"
+	"authz-service/internal/kafkatopics"
 	"authz-service/internal/producer"
-	"authz-service/internal/registry"
 	"authz-service/internal/worker"
 
 	"github.com/hop-/goconfig"
@@ -36,8 +36,9 @@ func main() {
 		log.Fatal("failed to load config: ", err)
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	// ctx is cancelled on SIGTERM/SIGINT.
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
+	defer stop()
 
 	// 2. Create pgxpool (primary - NO read-only hook)
 	pool, err := db.NewPool(ctx, &cfg, false)
@@ -47,20 +48,12 @@ func main() {
 	defer pool.Close()
 
 	// 3. Create Redis client
-	cacheTTL := time.Duration(cfg.CacheTTLSeconds) * time.Second
-	redisCache := cache.NewCache(cfg.RedisAddr, cacheTTL)
+	redisCache := cache.NewCache(cfg.RedisAddr)
 	defer redisCache.Close()
 
-	// 4. Load registry from DB
+	// 4. Queries on the primary. The worker keeps no in-memory registry: each
+	// event resolves role and permission ids inside its own transaction.
 	queries := db.NewQueries(pool)
-	reg, err := registry.New(ctx, queries)
-	if err != nil {
-		log.Fatal("failed to load registry: ", err)
-	}
-	slog.Info("registry loaded",
-		"permissions", reg.PermissionCount(),
-		"roles", reg.RoleCount(),
-	)
 
 	// 5. Create Kafka producer (for *.id.assigned events)
 	prod := producer.NewProducer(cfg.KafkaBrokers, cfg.KafkaTopic)
@@ -68,22 +61,9 @@ func main() {
 
 	// 6. Create worker handler
 	hostname, _ := os.Hostname()
-	handler := worker.NewHandler(queries, redisCache, reg, prod, hostname)
+	handler := worker.NewHandler(queries, redisCache, prod, hostname)
 
-	// 7. Start Kafka consumer
-	brokers := strings.Split(cfg.KafkaBrokers, ",")
-	consumer := worker.NewConsumer(brokers, cfg.KafkaTopic, cfg.KafkaGroupID, handler)
-
-	go func() {
-		slog.Info("worker consumer starting", "group_id", cfg.KafkaGroupID)
-		if err := consumer.Run(ctx); err != nil {
-			if ctx.Err() == nil {
-				slog.Error("consumer error", "error", err)
-			}
-		}
-	}()
-
-	// 8. Start metrics server
+	// 7. Start metrics server
 	metricsAddr := fmt.Sprintf(":%d", cfg.MetricsPort)
 	metricsMux := http.NewServeMux()
 	metricsMux.Handle("/metrics", promhttp.Handler())
@@ -99,20 +79,38 @@ func main() {
 		}
 	}()
 
-	// 9. Block on SIGTERM/SIGINT
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT)
-	sig := <-sigCh
-	slog.Info("received signal, shutting down", "signal", sig)
+	// 8. Wait for the main and DLQ topics (infra creates them), then start the
+	// Kafka consumer. A signal during the wait skips straight to shutdown.
+	brokers := strings.Split(cfg.KafkaBrokers, ",")
+	topics := []string{cfg.KafkaTopic, cfg.KafkaTopic + ".dlq"}
+	var consumer *worker.Consumer
+	if err := kafkatopics.Wait(ctx, brokers, topics...); err != nil {
+		slog.Info("shutdown requested while waiting for kafka topics", "topics", topics)
+	} else {
+		consumer = worker.NewConsumer(brokers, cfg.KafkaTopic, cfg.KafkaGroupID, handler)
+		go func() {
+			slog.Info("worker consumer starting", "group_id", cfg.KafkaGroupID)
+			if err := consumer.Run(ctx); err != nil {
+				if ctx.Err() == nil {
+					slog.Error("consumer error", "error", err)
+				}
+			}
+		}()
+	}
+
+	// 9. Block until SIGTERM/SIGINT
+	<-ctx.Done()
+	stop()
+	slog.Info("received signal, shutting down")
 
 	// 10. Graceful shutdown
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer shutdownCancel()
 
-	cancel()
-
-	if err := consumer.Close(); err != nil {
-		slog.Error("consumer close error", "error", err)
+	if consumer != nil {
+		if err := consumer.Close(); err != nil {
+			slog.Error("consumer close error", "error", err)
+		}
 	}
 	if err := metricsServer.Shutdown(shutdownCtx); err != nil {
 		slog.Error("metrics server shutdown error", "error", err)

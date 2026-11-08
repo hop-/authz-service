@@ -10,7 +10,6 @@ import (
 	"authz-service/internal/db"
 	"authz-service/internal/model"
 	"authz-service/internal/producer"
-	"authz-service/internal/registry"
 
 	"github.com/google/uuid"
 	"github.com/segmentio/kafka-go"
@@ -36,6 +35,13 @@ type fakeWriter struct {
 	err    error // returned by every write
 	permID int16 // returned by InsertPermission
 	roleID int16 // returned by InsertRole
+
+	// In-transaction natural-key lookups (not recorded in calls).
+	roleIDs     map[string]int16
+	permIDs     map[[2]string]int16
+	lookupErr   error
+	roleLookups []string
+	permLookups [][2]string
 }
 
 func (w *fakeWriter) record(method string, args ...any) error {
@@ -89,6 +95,25 @@ func (w *fakeWriter) DeleteRolePermission(_ context.Context, roleID, permissionI
 	return w.record("DeleteRolePermission", roleID, permissionID)
 }
 
+func (w *fakeWriter) RoleID(_ context.Context, name string) (int16, bool, error) {
+	w.roleLookups = append(w.roleLookups, name)
+	if w.lookupErr != nil {
+		return 0, false, w.lookupErr
+	}
+	id, ok := w.roleIDs[name]
+	return id, ok, nil
+}
+
+func (w *fakeWriter) PermissionID(_ context.Context, action, resourceType string) (int16, bool, error) {
+	key := [2]string{action, resourceType}
+	w.permLookups = append(w.permLookups, key)
+	if w.lookupErr != nil {
+		return 0, false, w.lookupErr
+	}
+	id, ok := w.permIDs[key]
+	return id, ok, nil
+}
+
 // --- Store ---
 
 type applyCall struct {
@@ -115,7 +140,10 @@ type fakeStore struct {
 
 func newFakeStore() *fakeStore {
 	return &fakeStore{
-		writer:  &fakeWriter{},
+		writer: &fakeWriter{
+			roleIDs: make(map[string]int16),
+			permIDs: make(map[[2]string]int16),
+		},
 		permIDs: make(map[[2]string]int16),
 		roleIDs: make(map[string]int16),
 	}
@@ -205,9 +233,12 @@ type published struct {
 type fakePublisher struct {
 	published  []published
 	publishErr error
-	dlq        []model.DLQMessage
+	dlq        []model.DLQMessage // successfully published DLQ messages
 	dlqKeys    []string
+	dlqErrs    []error // returned by successive PublishDLQ calls, then dlqErr
 	dlqErr     error
+	dlqTries   []model.DLQMessage // every PublishDLQ call, failed or not
+	onDLQ      func()             // runs at the start of every PublishDLQ call
 }
 
 func (p *fakePublisher) Publish(_ context.Context, key string, payload interface{}) error {
@@ -217,11 +248,22 @@ func (p *fakePublisher) Publish(_ context.Context, key string, payload interface
 }
 
 func (p *fakePublisher) PublishDLQ(_ context.Context, originalEventID string, payload interface{}) error {
-	p.dlqKeys = append(p.dlqKeys, originalEventID)
-	if m, ok := payload.(model.DLQMessage); ok {
-		p.dlq = append(p.dlq, m)
+	if p.onDLQ != nil {
+		p.onDLQ()
 	}
-	return p.dlqErr
+	m, _ := payload.(model.DLQMessage)
+	p.dlqTries = append(p.dlqTries, m)
+	err := p.dlqErr
+	if len(p.dlqErrs) > 0 {
+		err = p.dlqErrs[0]
+		p.dlqErrs = p.dlqErrs[1:]
+	}
+	if err != nil {
+		return err
+	}
+	p.dlqKeys = append(p.dlqKeys, originalEventID)
+	p.dlq = append(p.dlq, m)
+	return nil
 }
 
 // --- Harness ---
@@ -231,7 +273,6 @@ type harness struct {
 	store  *fakeStore
 	cache  *fakeCache
 	pub    *fakePublisher
-	reg    *registry.Registry
 	sleeps []time.Duration
 }
 
@@ -241,9 +282,8 @@ func newHarness(t *testing.T) *harness {
 		store: newFakeStore(),
 		cache: &fakeCache{},
 		pub:   &fakePublisher{},
-		reg:   registry.NewEmpty(),
 	}
-	hs.h = NewHandler(hs.store, hs.cache, hs.reg, hs.pub, "worker-1")
+	hs.h = NewHandler(hs.store, hs.cache, hs.pub, "worker-1")
 	hs.h.sleep = func(ctx context.Context, d time.Duration) error {
 		hs.sleeps = append(hs.sleeps, d)
 		return ctx.Err()
