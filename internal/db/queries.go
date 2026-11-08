@@ -17,14 +17,15 @@ import (
 // Query constants
 const (
 	// Steps 2 & 3: override lookup
-	checkOverrideQuery = `SELECT effect FROM user_permission_overrides
+	checkOverrideQuery = `SELECT effect, expires_at FROM user_permission_overrides
 WHERE user_id       = $1
   AND permission_id = $2
   AND resource_id   = $3
   AND (expires_at IS NULL OR expires_at > NOW())`
 
-	// Step 4: role expansion
-	checkRoleQuery = `SELECT r.name
+	// Step 4: role expansion. The longest-lived grant decides (a grant with no
+	// expiry first), with the role name as a deterministic tie-break.
+	checkRoleQuery = `SELECT r.name, ur.expires_at
 FROM user_roles ur
 JOIN role_permissions rp ON rp.role_id = ur.role_id
 JOIN roles r             ON r.id       = ur.role_id
@@ -33,6 +34,7 @@ WHERE ur.user_id       = $1
   AND ur.resource_type = $3
   AND ur.resource_id   = $4
   AND (ur.expires_at IS NULL OR ur.expires_at > NOW())
+ORDER BY ur.expires_at DESC NULLS FIRST, r.name
 LIMIT 1`
 
 	// GET /query/v1/resources — no scope filter
@@ -194,50 +196,59 @@ func (q *Queries) Pool() *pgxpool.Pool {
 	return q.pool
 }
 
-// CheckOverride returns the override effect for a user+permission+resource, if any.
-func (q *Queries) CheckOverride(ctx context.Context, userID uuid.UUID, permissionID int16, resourceID string) (*model.Effect, error) {
+// CheckOverride returns the active override effect for a user+permission+resource,
+// if any, and its expires_at (nil when it never expires). DENY wins over ALLOW.
+func (q *Queries) CheckOverride(ctx context.Context, userID uuid.UUID, permissionID int16, resourceID string) (*model.Effect, *time.Time, error) {
 	rows, err := q.pool.Query(ctx, checkOverrideQuery, userID, permissionID, resourceID)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	defer rows.Close()
 
 	var denyFound, allowFound bool
+	var denyExpires, allowExpires *time.Time
 	for rows.Next() {
 		var effect string
-		if err := rows.Scan(&effect); err != nil {
-			return nil, err
+		var expiresAt *time.Time
+		if err := rows.Scan(&effect, &expiresAt); err != nil {
+			return nil, nil, err
 		}
 		switch model.Effect(effect) {
 		case model.EffectDeny:
-			denyFound = true
+			denyFound, denyExpires = true, expiresAt
 		case model.EffectAllow:
-			allowFound = true
+			allowFound, allowExpires = true, expiresAt
 		}
 	}
 	if err := rows.Err(); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	if denyFound {
 		e := model.EffectDeny
-		return &e, nil
+		return &e, denyExpires, nil
 	}
 	if allowFound {
 		e := model.EffectAllow
-		return &e, nil
+		return &e, allowExpires, nil
 	}
-	return nil, nil
+	return nil, nil, nil
 }
 
-// CheckRole returns the role name if the user has the permission via a role assignment.
-func (q *Queries) CheckRole(ctx context.Context, userID uuid.UUID, permissionID int16, resourceType, resourceID string) (string, error) {
+// CheckRole returns the role name if the user has the permission via a role
+// assignment, and that assignment's expires_at (nil when it never expires).
+// When several assignments match, the longest-lived one is returned.
+func (q *Queries) CheckRole(ctx context.Context, userID uuid.UUID, permissionID int16, resourceType, resourceID string) (string, *time.Time, error) {
 	var roleName string
-	err := q.pool.QueryRow(ctx, checkRoleQuery, userID, permissionID, resourceType, resourceID).Scan(&roleName)
-	if err == pgx.ErrNoRows {
-		return "", nil
+	var expiresAt *time.Time
+	err := q.pool.QueryRow(ctx, checkRoleQuery, userID, permissionID, resourceType, resourceID).Scan(&roleName, &expiresAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", nil, nil
 	}
-	return roleName, err
+	if err != nil {
+		return "", nil, err
+	}
+	return roleName, expiresAt, nil
 }
 
 // Resources returns resource IDs where a user has the given permission.
@@ -473,6 +484,11 @@ type Writer interface {
 	DeleteRole(ctx context.Context, name string) error
 	InsertRolePermission(ctx context.Context, roleID, permissionID int16) error
 	DeleteRolePermission(ctx context.Context, roleID, permissionID int16) error
+	// RoleID and PermissionID resolve natural keys in the same transaction as the
+	// writes, so a concurrent remove and re-create can't leave a stale id.
+	// found is false (with a nil error) when the name doesn't exist.
+	RoleID(ctx context.Context, name string) (id int16, found bool, err error)
+	PermissionID(ctx context.Context, action, resourceType string) (id int16, found bool, err error)
 }
 
 // ApplyEvent runs fn in one transaction together with the event_log
@@ -616,6 +632,30 @@ func (w txWriter) DeleteRolePermission(ctx context.Context, roleID, permissionID
 		return fmt.Errorf("delete role_permission: %w", err)
 	}
 	return nil
+}
+
+func (w txWriter) RoleID(ctx context.Context, name string) (int16, bool, error) {
+	var id int16
+	err := w.tx.QueryRow(ctx, roleIDQuery, name).Scan(&id)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return 0, false, nil
+	}
+	if err != nil {
+		return 0, false, fmt.Errorf("lookup role id: %w", err)
+	}
+	return id, true, nil
+}
+
+func (w txWriter) PermissionID(ctx context.Context, action, resourceType string) (int16, bool, error) {
+	var id int16
+	err := w.tx.QueryRow(ctx, permissionIDQuery, action, resourceType).Scan(&id)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return 0, false, nil
+	}
+	if err != nil {
+		return 0, false, fmt.Errorf("lookup permission id: %w", err)
+	}
+	return id, true, nil
 }
 
 // Ping checks database connectivity.

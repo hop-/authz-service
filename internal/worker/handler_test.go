@@ -22,10 +22,11 @@ const (
 	readDocPerm  int16 = 9
 )
 
-// seedRegistry registers role "editor" and permission (read, document).
-func (hs *harness) seedRegistry() {
-	hs.reg.AddRole("editor", editorRoleID)
-	hs.reg.AddPermission("read", "document", readDocPerm)
+// seedIDs makes role "editor" and permission (read, document) exist in the
+// primary DB, as seen by in-transaction lookups.
+func (hs *harness) seedIDs() {
+	hs.store.writer.roleIDs["editor"] = editorRoleID
+	hs.store.writer.permIDs[[2]string{"read", "document"}] = readDocPerm
 }
 
 var wantBackoff = []time.Duration{
@@ -108,11 +109,6 @@ func dbEventCases() []eventCase {
 			payload: map[string]any{"action": "write", "resource_type": "project", "description": "Write access"},
 			writes:  []writerCall{{"InsertPermission", []any{"write", "project", "Write access"}}},
 			publish: &wantPublish{"action.id.assigned", map[string]any{"action": "write", "resource_type": "project", "id": int16(12)}},
-			check: func(t *testing.T, hs *harness) {
-				if id, ok := hs.reg.ResolvePermission("write", "project"); !ok || id != 12 {
-					t.Errorf("registry (write, project) = (%d, %v), want (12, true)", id, ok)
-				}
-			},
 		},
 		{
 			name:    "action.removed",
@@ -120,14 +116,6 @@ func dbEventCases() []eventCase {
 			payload: map[string]any{"action": "read", "resource_type": "document"},
 			writes:  []writerCall{{"DeletePermission", []any{"read", "document"}}},
 			flushes: 1,
-			check: func(t *testing.T, hs *harness) {
-				if _, ok := hs.reg.ResolvePermission("read", "document"); ok {
-					t.Error("permission still in registry after action.removed")
-				}
-				if hs.reg.RoleName(editorRoleID) != "editor" {
-					t.Error("action.removed touched role names")
-				}
-			},
 		},
 		{
 			name:    "role.created",
@@ -135,11 +123,6 @@ func dbEventCases() []eventCase {
 			payload: map[string]any{"role_name": "auditor", "description": "Audits"},
 			writes:  []writerCall{{"InsertRole", []any{"auditor", "Audits"}}},
 			publish: &wantPublish{"role.id.assigned", map[string]any{"role_name": "auditor", "id": int16(13)}},
-			check: func(t *testing.T, hs *harness) {
-				if id, ok := hs.reg.ResolveRole("auditor"); !ok || id != 13 {
-					t.Errorf("registry auditor = (%d, %v), want (13, true)", id, ok)
-				}
-			},
 		},
 		{
 			name:    "role.removed",
@@ -147,11 +130,6 @@ func dbEventCases() []eventCase {
 			payload: map[string]any{"role_name": "editor"},
 			writes:  []writerCall{{"DeleteRole", []any{"editor"}}},
 			flushes: 1,
-			check: func(t *testing.T, hs *harness) {
-				if _, ok := hs.reg.ResolveRole("editor"); ok {
-					t.Error("role still in registry after role.removed")
-				}
-			},
 		},
 		{
 			name:    "role_permissions.assigned",
@@ -217,7 +195,7 @@ func TestHandle_AppliedPath(t *testing.T) {
 	for _, tc := range dbEventCases() {
 		t.Run(tc.name, func(t *testing.T) {
 			hs := newHarness(t)
-			hs.seedRegistry()
+			hs.seedIDs()
 			hs.store.writer.permID = 12
 			hs.store.writer.roleID = 13
 
@@ -239,32 +217,39 @@ func TestHandle_AppliedPath(t *testing.T) {
 	}
 }
 
-func TestHandle_IDAssignedEventsUpdateRegistryWithoutDB(t *testing.T) {
-	t.Run("action.id.assigned", func(t *testing.T) {
-		hs := newHarness(t)
-		hs.handle(t, event(t, "action.id.assigned", map[string]any{"action": "write", "resource_type": "project", "id": 21}))
+// The worker keeps no registry (CL-1), so *.id.assigned events, which feed the
+// API registries, are no-ops for it: handled, with no DB, cache or publish work.
+func TestHandle_IDAssignedEventsAreNoOps(t *testing.T) {
+	tests := []struct {
+		name string
+		msg  func(t *testing.T) kafka.Message
+	}{
+		{"action.id.assigned", func(t *testing.T) kafka.Message {
+			return event(t, "action.id.assigned", map[string]any{"action": "write", "resource_type": "project", "id": 21})
+		}},
+		{"role.id.assigned", func(t *testing.T) kafka.Message {
+			return event(t, "role.id.assigned", map[string]any{"role_name": "auditor", "id": 22})
+		}},
+		{"malformed id is ignored too", func(t *testing.T) kafka.Message {
+			return event(t, "action.id.assigned", map[string]any{"action": "a", "resource_type": "b", "id": "x"})
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			hs := newHarness(t)
 
-		if id, ok := hs.reg.ResolvePermission("write", "project"); !ok || id != 21 {
-			t.Fatalf("registry (write, project) = (%d, %v), want (21, true)", id, ok)
-		}
-		if len(hs.store.applyCalls) != 0 {
-			t.Fatalf("action.id.assigned must not touch the DB, got %+v", hs.store.applyCalls)
-		}
-		hs.requireNoDLQ(t)
-	})
+			hs.handle(t, tt.msg(t))
 
-	t.Run("role.id.assigned", func(t *testing.T) {
-		hs := newHarness(t)
-		hs.handle(t, event(t, "role.id.assigned", map[string]any{"role_name": "auditor", "id": 22}))
-
-		if id, ok := hs.reg.ResolveRole("auditor"); !ok || id != 22 {
-			t.Fatalf("registry auditor = (%d, %v), want (22, true)", id, ok)
-		}
-		if len(hs.store.applyCalls) != 0 {
-			t.Fatalf("role.id.assigned must not touch the DB, got %+v", hs.store.applyCalls)
-		}
-		hs.requireNoDLQ(t)
-	})
+			if len(hs.store.applyCalls) != 0 || hs.store.roleLookups+hs.store.permLookups != 0 {
+				t.Fatalf("*.id.assigned must not touch the DB: apply=%d lookups=%d",
+					len(hs.store.applyCalls), hs.store.roleLookups+hs.store.permLookups)
+			}
+			if len(hs.cache.invalidations) != 0 || hs.cache.flushes != 0 || len(hs.pub.published) != 0 {
+				t.Fatal("*.id.assigned must not run follow-ups")
+			}
+			hs.requireNoDLQ(t)
+		})
+	}
 }
 
 // AC-4: a new event for an existing natural key succeeds and publishes the existing id.
@@ -300,7 +285,7 @@ func TestHandle_DuplicateRunsFollowUpsWithoutApplying(t *testing.T) {
 	for _, tc := range dbEventCases() {
 		t.Run(tc.name, func(t *testing.T) {
 			hs := newHarness(t)
-			hs.seedRegistry()
+			hs.seedIDs()
 			hs.store.duplicate = true
 			// Duplicate-path id lookups fall back to the DB.
 			hs.store.permIDs[[2]string{"write", "project"}] = 12
@@ -328,24 +313,7 @@ func TestHandle_DuplicateRegistrationResolvesID(t *testing.T) {
 		return event(t, "role.created", map[string]any{"role_name": "auditor"})
 	}
 
-	t.Run("action id from registry", func(t *testing.T) {
-		hs := newHarness(t)
-		hs.store.duplicate = true
-		hs.reg.AddPermission("write", "project", 21)
-
-		hs.handle(t, actionMsg(t))
-
-		if hs.store.permLookups != 0 {
-			t.Errorf("registry hit must not query the DB, got %d lookups", hs.store.permLookups)
-		}
-		if len(hs.pub.published) != 1 {
-			t.Fatalf("got %d publishes, want 1", len(hs.pub.published))
-		}
-		requirePublished(t, hs.pub.published[0], &wantPublish{"action.id.assigned", map[string]any{"id": int16(21)}})
-		hs.requireNoDLQ(t)
-	})
-
-	t.Run("action id from DB when registry misses", func(t *testing.T) {
+	t.Run("action id from DB", func(t *testing.T) {
 		hs := newHarness(t)
 		hs.store.duplicate = true
 		hs.store.permIDs[[2]string{"write", "project"}] = 12
@@ -354,9 +322,6 @@ func TestHandle_DuplicateRegistrationResolvesID(t *testing.T) {
 
 		if hs.store.permLookups != 1 {
 			t.Errorf("PermissionID lookups = %d, want 1", hs.store.permLookups)
-		}
-		if id, ok := hs.reg.ResolvePermission("write", "project"); !ok || id != 12 {
-			t.Errorf("registry not repaired: (%d, %v)", id, ok)
 		}
 		if len(hs.pub.published) != 1 {
 			t.Fatalf("got %d publishes, want 1", len(hs.pub.published))
@@ -374,38 +339,18 @@ func TestHandle_DuplicateRegistrationResolvesID(t *testing.T) {
 		if len(hs.pub.published) != 0 {
 			t.Errorf("removed permission must not be re-published: %+v", hs.pub.published)
 		}
-		if _, ok := hs.reg.ResolvePermission("write", "project"); ok {
-			t.Error("removed permission re-added to the registry")
-		}
 		hs.requireNoDLQ(t)
 	})
 
-	t.Run("role id from registry", func(t *testing.T) {
-		hs := newHarness(t)
-		hs.store.duplicate = true
-		hs.reg.AddRole("auditor", 23)
-
-		hs.handle(t, roleMsg(t))
-
-		if hs.store.roleLookups != 0 {
-			t.Errorf("registry hit must not query the DB, got %d lookups", hs.store.roleLookups)
-		}
-		if len(hs.pub.published) != 1 {
-			t.Fatalf("got %d publishes, want 1", len(hs.pub.published))
-		}
-		requirePublished(t, hs.pub.published[0], &wantPublish{"role.id.assigned", map[string]any{"role_name": "auditor", "id": int16(23)}})
-		hs.requireNoDLQ(t)
-	})
-
-	t.Run("role id from DB when registry misses", func(t *testing.T) {
+	t.Run("role id from DB", func(t *testing.T) {
 		hs := newHarness(t)
 		hs.store.duplicate = true
 		hs.store.roleIDs["auditor"] = 13
 
 		hs.handle(t, roleMsg(t))
 
-		if id, ok := hs.reg.ResolveRole("auditor"); !ok || id != 13 {
-			t.Errorf("registry not repaired: (%d, %v)", id, ok)
+		if hs.store.roleLookups != 1 {
+			t.Errorf("RoleID lookups = %d, want 1", hs.store.roleLookups)
 		}
 		if len(hs.pub.published) != 1 {
 			t.Fatalf("got %d publishes, want 1", len(hs.pub.published))
@@ -422,9 +367,6 @@ func TestHandle_DuplicateRegistrationResolvesID(t *testing.T) {
 
 		if len(hs.pub.published) != 0 {
 			t.Errorf("removed role must not be re-published: %+v", hs.pub.published)
-		}
-		if _, ok := hs.reg.ResolveRole("auditor"); ok {
-			t.Error("removed role re-added to the registry")
 		}
 		hs.requireNoDLQ(t)
 	})
@@ -451,7 +393,7 @@ func TestHandle_DuplicateRegistrationResolvesID(t *testing.T) {
 func TestHandle_FollowUpFailureRetriedThenDeadLettered(t *testing.T) {
 	t.Run("cache invalidation", func(t *testing.T) {
 		hs := newHarness(t)
-		hs.seedRegistry()
+		hs.seedIDs()
 		hs.cache.err = errors.New("redis down")
 
 		hs.handle(t, event(t, "role.revoked", map[string]any{
@@ -475,7 +417,7 @@ func TestHandle_FollowUpFailureRetriedThenDeadLettered(t *testing.T) {
 
 	t.Run("cache flush", func(t *testing.T) {
 		hs := newHarness(t)
-		hs.seedRegistry()
+		hs.seedIDs()
 		hs.cache.err = errors.New("redis down")
 
 		hs.handle(t, event(t, "role_permissions.assigned", map[string]any{
@@ -515,7 +457,7 @@ func TestHandle_FollowUpFailureRetriedThenDeadLettered(t *testing.T) {
 
 func TestHandle_FollowUpRecoversWithinRetries(t *testing.T) {
 	hs := newHarness(t)
-	hs.seedRegistry()
+	hs.seedIDs()
 	hs.cache.errs = []error{errors.New("blip"), errors.New("blip")}
 
 	hs.handle(t, event(t, "override.removed", map[string]any{
@@ -583,7 +525,7 @@ func TestHandle_DBErrorClassification(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			hs := newHarness(t)
-			hs.seedRegistry()
+			hs.seedIDs()
 			// The write fails inside the transaction, wrapped the way the db layer wraps it.
 			hs.store.writer.err = fmt.Errorf("insert user_role: %w", tt.err)
 
@@ -618,7 +560,7 @@ func TestHandle_DBErrorClassification(t *testing.T) {
 
 func TestHandle_TransientDBErrorRecovers(t *testing.T) {
 	hs := newHarness(t)
-	hs.seedRegistry()
+	hs.seedIDs()
 	hs.store.applyErrs = []error{errors.New("connection reset"), nil}
 
 	hs.handle(t, event(t, "role.revoked", map[string]any{
@@ -638,7 +580,7 @@ func TestHandle_TransientDBErrorRecovers(t *testing.T) {
 }
 
 func TestNewHandler_DefaultSleepHonoursContext(t *testing.T) {
-	h := NewHandler(newFakeStore(), &fakeCache{}, nil, &fakePublisher{}, "w")
+	h := NewHandler(newFakeStore(), &fakeCache{}, &fakePublisher{}, "w")
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	start := time.Now()
@@ -676,7 +618,7 @@ func TestHandle_InvalidEventIDDeadLetteredBeforeDB(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			hs := newHarness(t)
-			hs.seedRegistry()
+			hs.seedIDs()
 
 			hs.handle(t, tt.msg(t))
 
@@ -713,19 +655,9 @@ func TestHandle_BadInputDeadLetteredPermanent(t *testing.T) {
 		{"invalid user_id", func(t *testing.T) kafka.Message {
 			return event(t, "role.revoked", map[string]any{"user_id": "nope", "role_name": "editor"})
 		}},
-		{"unknown role", func(t *testing.T) kafka.Message {
-			return event(t, "role.assigned", map[string]any{
-				"user_id": testUserID.String(), "role_name": "ghost", "granted_by": testActorID.String(),
-			})
-		}},
 		{"invalid granted_by", func(t *testing.T) kafka.Message {
 			return event(t, "role.assigned", map[string]any{
 				"user_id": testUserID.String(), "role_name": "editor", "granted_by": "",
-			})
-		}},
-		{"unknown permission", func(t *testing.T) kafka.Message {
-			return event(t, "override.set", map[string]any{
-				"user_id": testUserID.String(), "action": "fly", "resource_type": "document", "set_by": testActorID.String(),
 			})
 		}},
 		{"invalid set_by", func(t *testing.T) kafka.Message {
@@ -733,19 +665,11 @@ func TestHandle_BadInputDeadLetteredPermanent(t *testing.T) {
 				"user_id": testUserID.String(), "action": "read", "resource_type": "document", "set_by": "x",
 			})
 		}},
-		{"role permission with unknown permission", func(t *testing.T) kafka.Message {
-			return event(t, "role_permissions.assigned", map[string]any{
-				"role_name": "editor", "action": "fly", "resource_type": "document",
-			})
-		}},
-		{"id.assigned with non-numeric id", func(t *testing.T) kafka.Message {
-			return event(t, "action.id.assigned", map[string]any{"action": "a", "resource_type": "b", "id": "x"})
-		}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			hs := newHarness(t)
-			hs.seedRegistry()
+			hs.seedIDs()
 
 			hs.handle(t, tt.msg(t))
 
@@ -799,7 +723,7 @@ func TestHandle_CancelledContextAbortsWithoutDLQ(t *testing.T) {
 
 	t.Run("during the transaction", func(t *testing.T) {
 		hs := newHarness(t)
-		hs.seedRegistry()
+		hs.seedIDs()
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
 		hs.store.onApply = cancel
@@ -821,7 +745,7 @@ func TestHandle_CancelledContextAbortsWithoutDLQ(t *testing.T) {
 
 	t.Run("during DB backoff", func(t *testing.T) {
 		hs := newHarness(t)
-		hs.seedRegistry()
+		hs.seedIDs()
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
 		hs.store.applyErr = errors.New("connection reset")
@@ -843,7 +767,7 @@ func TestHandle_CancelledContextAbortsWithoutDLQ(t *testing.T) {
 
 	t.Run("during follow-up backoff", func(t *testing.T) {
 		hs := newHarness(t)
-		hs.seedRegistry()
+		hs.seedIDs()
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
 		hs.cache.err = errors.New("redis down")
@@ -865,7 +789,7 @@ func TestHandle_CancelledContextAbortsWithoutDLQ(t *testing.T) {
 
 	t.Run("permanent error after cancellation is not dead-lettered", func(t *testing.T) {
 		hs := newHarness(t)
-		hs.seedRegistry()
+		hs.seedIDs()
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
 		hs.store.onApply = cancel

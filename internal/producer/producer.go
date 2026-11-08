@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"strings"
 	"time"
 
@@ -14,24 +15,28 @@ import (
 )
 
 type Producer struct {
-	writer   *kafka.Writer
-	brokers  []string
-	dlqTopic string
+	writer    *kafka.Writer
+	dlqWriter *kafka.Writer
+	brokers   []string
 }
 
 func NewProducer(brokers string, topic string) *Producer {
 	brokerList := strings.Split(brokers, ",")
-	w := &kafka.Writer{
-		Addr:         kafka.TCP(brokerList...),
+	addr := kafka.TCP(brokerList...)
+	return &Producer{
+		writer:    newWriter(addr, topic),
+		dlqWriter: newWriter(addr, topic+".dlq"),
+		brokers:   brokerList,
+	}
+}
+
+func newWriter(addr net.Addr, topic string) *kafka.Writer {
+	return &kafka.Writer{
+		Addr:         addr,
 		Topic:        topic,
 		Balancer:     &kafka.Hash{},
 		RequiredAcks: kafka.RequireAll,
 		MaxAttempts:  3,
-	}
-	return &Producer{
-		writer:   w,
-		brokers:  brokerList,
-		dlqTopic: topic + ".dlq",
 	}
 }
 
@@ -53,15 +58,7 @@ func (p *Producer) PublishDLQ(ctx context.Context, originalEventID string, paylo
 	if err != nil {
 		return err
 	}
-	dlqWriter := &kafka.Writer{
-		Addr:         p.writer.Addr,
-		Topic:        p.dlqTopic,
-		Balancer:     &kafka.Hash{},
-		RequiredAcks: kafka.RequireAll,
-		MaxAttempts:  3,
-	}
-	defer dlqWriter.Close()
-	return dlqWriter.WriteMessages(ctx, kafka.Message{
+	return p.dlqWriter.WriteMessages(ctx, kafka.Message{
 		Key:   []byte(originalEventID),
 		Value: data,
 	})
@@ -112,7 +109,7 @@ func (p *Producer) Ping(ctx context.Context) error {
 	return errors.Join(errs...)
 }
 
-// Close closes the underlying writer.
+// Close closes the main and DLQ writers.
 func (p *Producer) Close() error {
-	return p.writer.Close()
+	return errors.Join(p.writer.Close(), p.dlqWriter.Close())
 }

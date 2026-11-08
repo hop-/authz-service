@@ -2,9 +2,8 @@ package registry
 
 import (
 	"context"
+	"fmt"
 	"sync"
-
-	"authz-service/internal/db"
 )
 
 type permKey struct {
@@ -19,13 +18,19 @@ type Registry struct {
 	roleNames   map[int16]string  // id -> role_name (for source labels)
 }
 
-func New(ctx context.Context, q *db.Queries) (*Registry, error) {
-	r := &Registry{
-		permissions: make(map[permKey]int16),
-		roles:       make(map[string]int16),
-		roleNames:   make(map[int16]string),
+// Loader reads the full registry from the database. *db.Queries satisfies it.
+type Loader interface {
+	LoadPermissions(ctx context.Context) (map[[2]string]int16, error)
+	LoadRoles(ctx context.Context) (map[string]int16, error)
+}
+
+// New creates a registry loaded from l.
+func New(ctx context.Context, l Loader) (*Registry, error) {
+	r := NewEmpty()
+	if err := r.Reload(ctx, l); err != nil {
+		return nil, err
 	}
-	return r, r.load(ctx, q)
+	return r, nil
 }
 
 // NewEmpty creates an empty registry for testing or manual population.
@@ -37,23 +42,35 @@ func NewEmpty() *Registry {
 	}
 }
 
-func (r *Registry) load(ctx context.Context, q *db.Queries) error {
-	perms, err := q.LoadPermissions(ctx)
+// Reload replaces the registry's contents with a fresh snapshot from l. The
+// new maps are built first and swapped in under the lock, so readers see
+// either the old or the new snapshot. On error the registry is unchanged.
+func (r *Registry) Reload(ctx context.Context, l Loader) error {
+	perms, err := l.LoadPermissions(ctx)
 	if err != nil {
-		return err
+		return fmt.Errorf("load permissions: %w", err)
 	}
-	for key, id := range perms {
-		r.permissions[permKey{Action: key[0], ResourceType: key[1]}] = id
+	roles, err := l.LoadRoles(ctx)
+	if err != nil {
+		return fmt.Errorf("load roles: %w", err)
 	}
 
-	roles, err := q.LoadRoles(ctx)
-	if err != nil {
-		return err
+	permissions := make(map[permKey]int16, len(perms))
+	for key, id := range perms {
+		permissions[permKey{Action: key[0], ResourceType: key[1]}] = id
 	}
+	roleIDs := make(map[string]int16, len(roles))
+	roleNames := make(map[int16]string, len(roles))
 	for name, id := range roles {
-		r.roles[name] = id
-		r.roleNames[id] = name
+		roleIDs[name] = id
+		roleNames[id] = name
 	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.permissions = permissions
+	r.roles = roleIDs
+	r.roleNames = roleNames
 	return nil
 }
 

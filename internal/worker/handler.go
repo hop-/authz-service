@@ -11,7 +11,6 @@ import (
 	"authz-service/internal/db"
 	"authz-service/internal/model"
 	"authz-service/internal/producer"
-	"authz-service/internal/registry"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -24,6 +23,13 @@ const (
 	initialBackoff = 100 * time.Millisecond
 )
 
+// DLQ publish policy: retried until it succeeds or ctx is done, so a message
+// is never committed without reaching the DLQ.
+const (
+	dlqInitialBackoff = 100 * time.Millisecond
+	dlqMaxBackoff     = 30 * time.Second
+)
+
 // EventEnvelope is the common envelope for all Kafka events.
 type EventEnvelope struct {
 	Event      string    `json:"event"`
@@ -31,7 +37,10 @@ type EventEnvelope struct {
 	OccurredAt time.Time `json:"occurred_at"`
 }
 
-// store is the worker's view of the primary database.
+// store is the worker's view of the primary database. The worker keeps no
+// in-memory registry: role and permission ids are resolved in each event's
+// transaction (db.Writer), and PermissionID/RoleID serve the follow-ups of
+// duplicate registrations.
 type store interface {
 	ApplyEvent(ctx context.Context, eventID uuid.UUID, eventType string, fn func(db.Writer) error) (bool, error)
 	PermissionID(ctx context.Context, action, resourceType string) (int16, bool, error)
@@ -53,7 +62,6 @@ type publisher interface {
 type Handler struct {
 	store    store
 	cache    invalidator
-	registry *registry.Registry
 	producer publisher
 	workerID string
 	// sleep waits d between retries and returns ctx.Err() if ctx is done first.
@@ -61,11 +69,10 @@ type Handler struct {
 	sleep func(ctx context.Context, d time.Duration) error
 }
 
-func NewHandler(s store, c invalidator, reg *registry.Registry, p publisher, workerID string) *Handler {
+func NewHandler(s store, c invalidator, p publisher, workerID string) *Handler {
 	return &Handler{
 		store:    s,
 		cache:    c,
-		registry: reg,
 		producer: p,
 		workerID: workerID,
 		sleep:    sleepContext,
@@ -87,7 +94,7 @@ func sleepContext(ctx context.Context, d time.Duration) error {
 type eventPlan struct {
 	// apply runs inside store.ApplyEvent's transaction. nil means the event has no DB phase.
 	apply func(ctx context.Context, w db.Writer) error
-	// after runs the idempotent follow-ups (cache, registry, *.id.assigned publish).
+	// after runs the idempotent follow-ups (cache, *.id.assigned publish).
 	// It runs on both the applied and the duplicate outcome; applied tells which.
 	after func(ctx context.Context, applied bool) error
 }
@@ -123,18 +130,18 @@ func isPermanent(err error) bool {
 }
 
 // Handle processes one message. It returns nil when the message is handled
-// (applied, duplicate, or routed to the DLQ) and a non-nil error only when
+// (applied, duplicate, or published to the DLQ) and a non-nil error only when
 // processing was aborted because ctx was cancelled; the caller must then not
 // commit the offset.
 func (h *Handler) Handle(ctx context.Context, msg kafka.Message) error {
 	var env EventEnvelope
 	if err := json.Unmarshal(msg.Value, &env); err != nil {
-		return h.sendToDLQ(ctx, msg, env, model.DLQReasonPermanent, fmt.Errorf("decode envelope: %w", err), 0)
+		return h.deadLetter(ctx, msg, env, model.DLQReasonPermanent, fmt.Errorf("decode envelope: %w", err), 0)
 	}
 
 	eventID, err := uuid.Parse(env.EventID)
 	if err != nil {
-		return h.sendToDLQ(ctx, msg, env, model.DLQReasonPermanent, fmt.Errorf("invalid event_id %q: %w", env.EventID, err), 0)
+		return h.deadLetter(ctx, msg, env, model.DLQReasonPermanent, fmt.Errorf("invalid event_id %q: %w", env.EventID, err), 0)
 	}
 
 	slog.Info("processing event",
@@ -144,7 +151,7 @@ func (h *Handler) Handle(ctx context.Context, msg kafka.Message) error {
 
 	plan, err := h.prepare(env, msg.Value)
 	if err != nil {
-		return h.sendToDLQ(ctx, msg, env, model.DLQReasonPermanent, err, 0)
+		return h.deadLetter(ctx, msg, env, model.DLQReasonPermanent, err, 0)
 	}
 
 	applied := false
@@ -203,9 +210,19 @@ func (h *Handler) retry(ctx context.Context, env EventEnvelope, op func(ctx cont
 	}
 }
 
-// fail routes a phase failure: abort without DLQ when ctx is done, otherwise
-// DLQ as permanent or transient_exhausted.
+// fail routes a phase failure to the DLQ as permanent or transient_exhausted.
 func (h *Handler) fail(ctx context.Context, msg kafka.Message, env EventEnvelope, err error, retries int) error {
+	reason := model.DLQReasonTransientExhausted
+	if isPermanent(err) {
+		reason = model.DLQReasonPermanent
+	}
+	return h.deadLetter(ctx, msg, env, reason, err, retries)
+}
+
+// deadLetter is the only way Handle reaches the DLQ. When ctx is already done
+// it aborts without publishing, so the message is not committed and is
+// redelivered; otherwise it publishes the DLQ message.
+func (h *Handler) deadLetter(ctx context.Context, msg kafka.Message, env EventEnvelope, reason model.DLQReason, err error, retries int) error {
 	if ctxErr := ctx.Err(); ctxErr != nil {
 		slog.Warn("event processing aborted",
 			"event_id", env.EventID,
@@ -214,12 +231,13 @@ func (h *Handler) fail(ctx context.Context, msg kafka.Message, env EventEnvelope
 		)
 		return ctxErr
 	}
-	if isPermanent(err) {
-		return h.sendToDLQ(ctx, msg, env, model.DLQReasonPermanent, err, retries)
-	}
-	return h.sendToDLQ(ctx, msg, env, model.DLQReasonTransientExhausted, err, retries)
+	return h.sendToDLQ(ctx, msg, env, reason, err, retries)
 }
 
+// sendToDLQ publishes the DLQ message, retrying with capped backoff until the
+// publish succeeds (nil: handled, the offset may be committed) or ctx is done
+// (ctx error: aborted, the offset must not be committed). The partition stalls
+// while the DLQ is unavailable, which is preferred over losing the event.
 func (h *Handler) sendToDLQ(ctx context.Context, msg kafka.Message, env EventEnvelope, reason model.DLQReason, originalErr error, retryCount int) error {
 	dlqMsg := model.DLQMessage{
 		DLQEventID:    producer.NewEventID(),
@@ -241,16 +259,43 @@ func (h *Handler) sendToDLQ(ctx context.Context, msg kafka.Message, env EventEnv
 		OriginalPayload:    msg.Value,
 	}
 
-	if err := h.producer.PublishDLQ(ctx, env.EventID, dlqMsg); err != nil {
-		// Best-effort: log the full DLQ message if publish fails
-		dlqJSON, jsonErr := json.Marshal(dlqMsg)
-		if jsonErr != nil {
-			dlqJSON = []byte(fmt.Sprintf("<marshal failed: %v>", jsonErr))
+	delay := dlqInitialBackoff
+	for attempt := 1; ; attempt++ {
+		err := h.producer.PublishDLQ(ctx, env.EventID, dlqMsg)
+		if err == nil {
+			break
 		}
-		slog.Error("failed to publish to DLQ",
+		if attempt == 1 {
+			// Log the full message once, so it survives even if the process dies
+			// before the DLQ is back.
+			dlqJSON, jsonErr := json.Marshal(dlqMsg)
+			if jsonErr != nil {
+				dlqJSON = []byte(fmt.Sprintf("<marshal failed: %v>", jsonErr))
+			}
+			slog.Error("failed to publish to DLQ, retrying until it succeeds",
+				"event_id", env.EventID,
+				"error", err,
+				"dlq_message", string(dlqJSON),
+			)
+		}
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			slog.Warn("DLQ publish aborted, offset not committed",
+				"event_id", env.EventID,
+				"attempt", attempt,
+				"error", err,
+			)
+			return ctxErr
+		}
+		slog.Warn("DLQ publish failed, retrying",
+			"event_id", env.EventID,
+			"attempt", attempt,
+			"backoff", delay,
 			"error", err,
-			"dlq_message", string(dlqJSON),
 		)
+		if err := h.sleep(ctx, delay); err != nil {
+			return err
+		}
+		delay = min(delay*2, dlqMaxBackoff)
 	}
 
 	slog.Warn("message sent to DLQ",
@@ -261,13 +306,14 @@ func (h *Handler) sendToDLQ(ctx context.Context, msg kafka.Message, env EventEnv
 		"original_error", originalErr.Error(),
 	)
 
-	return nil // DLQ-routed messages are considered handled
+	return nil // published to the DLQ: handled
 }
 
-// --- Prepare: decode, validate, resolve registry ids ---
+// --- Prepare: decode and validate ---
 
 // prepare builds the plan for one event. Every error it returns is a
-// validationError, so it is permanent.
+// validationError, so it is permanent. Role and permission ids are not
+// resolved here: each apply resolves them inside the event's transaction.
 func (h *Handler) prepare(env EventEnvelope, payload []byte) (eventPlan, error) {
 	switch env.Event {
 	case "role.assigned":
@@ -282,18 +328,17 @@ func (h *Handler) prepare(env EventEnvelope, payload []byte) (eventPlan, error) 
 		return h.prepareActionRegistered(payload)
 	case "action.removed":
 		return h.prepareActionRemoved(payload)
-	case "action.id.assigned":
-		return h.prepareActionIDAssigned(payload)
 	case "role.created":
 		return h.prepareRoleCreated(payload)
 	case "role.removed":
 		return h.prepareRoleRemoved(payload)
-	case "role.id.assigned":
-		return h.prepareRoleIDAssigned(payload)
 	case "role_permissions.assigned":
 		return h.prepareRolePermAssigned(payload)
 	case "role_permissions.removed":
 		return h.prepareRolePermRemoved(payload)
+	case "action.id.assigned", "role.id.assigned":
+		// For the API registries. The worker keeps no registry, so nothing to do.
+		return eventPlan{}, nil
 	default:
 		return eventPlan{}, invalid("unknown event type: %s", env.Event)
 	}
@@ -314,17 +359,27 @@ func parseUUID(field, value string) (uuid.UUID, error) {
 	return id, nil
 }
 
-func (h *Handler) resolveRole(name string) (int16, error) {
-	id, ok := h.registry.ResolveRole(name)
-	if !ok {
+// roleIDIn resolves a role id inside the event's transaction. A role that
+// doesn't exist is a validationError (permanent; the transaction rolls back);
+// a failed lookup is transient.
+func roleIDIn(ctx context.Context, w db.Writer, name string) (int16, error) {
+	id, found, err := w.RoleID(ctx, name)
+	if err != nil {
+		return 0, fmt.Errorf("lookup role %s: %w", name, err)
+	}
+	if !found {
 		return 0, invalid("unknown role: %s", name)
 	}
 	return id, nil
 }
 
-func (h *Handler) resolvePermission(action, resourceType string) (int16, error) {
-	id, ok := h.registry.ResolvePermission(action, resourceType)
-	if !ok {
+// permissionIDIn is roleIDIn for permissions.
+func permissionIDIn(ctx context.Context, w db.Writer, action, resourceType string) (int16, error) {
+	id, found, err := w.PermissionID(ctx, action, resourceType)
+	if err != nil {
+		return 0, fmt.Errorf("lookup permission (%s, %s): %w", action, resourceType, err)
+	}
+	if !found {
 		return 0, invalid("unknown permission: (%s, %s)", action, resourceType)
 	}
 	return id, nil
@@ -364,10 +419,6 @@ func (h *Handler) prepareRoleAssigned(env EventEnvelope, payload []byte) (eventP
 	if err != nil {
 		return eventPlan{}, err
 	}
-	roleID, err := h.resolveRole(evt.RoleName)
-	if err != nil {
-		return eventPlan{}, err
-	}
 	grantedBy, err := parseUUID("granted_by", evt.GrantedBy)
 	if err != nil {
 		return eventPlan{}, err
@@ -375,6 +426,10 @@ func (h *Handler) prepareRoleAssigned(env EventEnvelope, payload []byte) (eventP
 
 	return eventPlan{
 		apply: func(ctx context.Context, w db.Writer) error {
+			roleID, err := roleIDIn(ctx, w, evt.RoleName)
+			if err != nil {
+				return err
+			}
 			return w.InsertUserRole(ctx, userID, roleID, evt.ResourceType, evt.ResourceID, evt.Scope, grantedBy, env.OccurredAt, evt.ExpiresAt)
 		},
 		after: h.invalidateAfter(userID, evt.ResourceType, evt.ResourceID),
@@ -395,13 +450,13 @@ func (h *Handler) prepareRoleRevoked(payload []byte) (eventPlan, error) {
 	if err != nil {
 		return eventPlan{}, err
 	}
-	roleID, err := h.resolveRole(evt.RoleName)
-	if err != nil {
-		return eventPlan{}, err
-	}
 
 	return eventPlan{
 		apply: func(ctx context.Context, w db.Writer) error {
+			roleID, err := roleIDIn(ctx, w, evt.RoleName)
+			if err != nil {
+				return err
+			}
 			return w.DeleteUserRole(ctx, userID, roleID, evt.ResourceType, evt.ResourceID)
 		},
 		after: h.invalidateAfter(userID, evt.ResourceType, evt.ResourceID),
@@ -427,10 +482,6 @@ func (h *Handler) prepareOverrideSet(env EventEnvelope, payload []byte) (eventPl
 	if err != nil {
 		return eventPlan{}, err
 	}
-	permID, err := h.resolvePermission(evt.Action, evt.ResourceType)
-	if err != nil {
-		return eventPlan{}, err
-	}
 	setBy, err := parseUUID("set_by", evt.SetBy)
 	if err != nil {
 		return eventPlan{}, err
@@ -438,6 +489,10 @@ func (h *Handler) prepareOverrideSet(env EventEnvelope, payload []byte) (eventPl
 
 	return eventPlan{
 		apply: func(ctx context.Context, w db.Writer) error {
+			permID, err := permissionIDIn(ctx, w, evt.Action, evt.ResourceType)
+			if err != nil {
+				return err
+			}
 			return w.UpsertOverride(ctx, userID, permID, evt.ResourceID, evt.Scope, model.Effect(evt.Effect), evt.Reason, setBy, env.OccurredAt, evt.ExpiresAt)
 		},
 		after: h.invalidateAfter(userID, evt.ResourceType, evt.ResourceID),
@@ -458,13 +513,13 @@ func (h *Handler) prepareOverrideRemoved(payload []byte) (eventPlan, error) {
 	if err != nil {
 		return eventPlan{}, err
 	}
-	permID, err := h.resolvePermission(evt.Action, evt.ResourceType)
-	if err != nil {
-		return eventPlan{}, err
-	}
 
 	return eventPlan{
 		apply: func(ctx context.Context, w db.Writer) error {
+			permID, err := permissionIDIn(ctx, w, evt.Action, evt.ResourceType)
+			if err != nil {
+				return err
+			}
 			return w.DeleteOverride(ctx, userID, permID, evt.ResourceID)
 		},
 		after: h.invalidateAfter(userID, evt.ResourceType, evt.ResourceID),
@@ -496,9 +551,9 @@ func (h *Handler) prepareActionRegistered(payload []byte) (eventPlan, error) {
 			if !applied {
 				var found bool
 				var err error
-				id, found, err = h.lookupPermissionID(ctx, evt.Action, evt.ResourceType)
+				id, found, err = h.store.PermissionID(ctx, evt.Action, evt.ResourceType)
 				if err != nil {
-					return err
+					return fmt.Errorf("lookup permission (%s, %s): %w", evt.Action, evt.ResourceType, err)
 				}
 				if !found {
 					slog.Info("permission no longer exists, skipping follow-ups",
@@ -506,8 +561,6 @@ func (h *Handler) prepareActionRegistered(payload []byte) (eventPlan, error) {
 					return nil
 				}
 			}
-
-			h.registry.AddPermission(evt.Action, evt.ResourceType, id)
 
 			idEvent := producer.NewEventEnvelope("action.id.assigned")
 			idEvent["action"] = evt.Action
@@ -519,18 +572,6 @@ func (h *Handler) prepareActionRegistered(payload []byte) (eventPlan, error) {
 			return nil
 		},
 	}, nil
-}
-
-// lookupPermissionID resolves a permission id from the registry, falling back to the primary DB.
-func (h *Handler) lookupPermissionID(ctx context.Context, action, resourceType string) (int16, bool, error) {
-	if id, ok := h.registry.ResolvePermission(action, resourceType); ok {
-		return id, true, nil
-	}
-	id, found, err := h.store.PermissionID(ctx, action, resourceType)
-	if err != nil {
-		return 0, false, fmt.Errorf("lookup permission (%s, %s): %w", action, resourceType, err)
-	}
-	return id, found, nil
 }
 
 func (h *Handler) prepareActionRemoved(payload []byte) (eventPlan, error) {
@@ -546,29 +587,7 @@ func (h *Handler) prepareActionRemoved(payload []byte) (eventPlan, error) {
 		apply: func(ctx context.Context, w db.Writer) error {
 			return w.DeletePermission(ctx, evt.Action, evt.ResourceType)
 		},
-		after: func(ctx context.Context, _ bool) error {
-			h.registry.RemovePermission(evt.Action, evt.ResourceType)
-			return h.flushAll(ctx)
-		},
-	}, nil
-}
-
-func (h *Handler) prepareActionIDAssigned(payload []byte) (eventPlan, error) {
-	var evt struct {
-		Action       string `json:"action"`
-		ResourceType string `json:"resource_type"`
-		ID           int16  `json:"id"`
-	}
-	if err := decodePayload(payload, &evt); err != nil {
-		return eventPlan{}, err
-	}
-
-	// No DB phase: the registry update is an idempotent no-op if already present.
-	return eventPlan{
-		after: func(context.Context, bool) error {
-			h.registry.AddPermission(evt.Action, evt.ResourceType, evt.ID)
-			return nil
-		},
+		after: func(ctx context.Context, _ bool) error { return h.flushAll(ctx) },
 	}, nil
 }
 
@@ -596,17 +615,15 @@ func (h *Handler) prepareRoleCreated(payload []byte) (eventPlan, error) {
 			if !applied {
 				var found bool
 				var err error
-				id, found, err = h.lookupRoleID(ctx, evt.RoleName)
+				id, found, err = h.store.RoleID(ctx, evt.RoleName)
 				if err != nil {
-					return err
+					return fmt.Errorf("lookup role %s: %w", evt.RoleName, err)
 				}
 				if !found {
 					slog.Info("role no longer exists, skipping follow-ups", "role_name", evt.RoleName)
 					return nil
 				}
 			}
-
-			h.registry.AddRole(evt.RoleName, id)
 
 			idEvent := producer.NewEventEnvelope("role.id.assigned")
 			idEvent["role_name"] = evt.RoleName
@@ -617,18 +634,6 @@ func (h *Handler) prepareRoleCreated(payload []byte) (eventPlan, error) {
 			return nil
 		},
 	}, nil
-}
-
-// lookupRoleID resolves a role id from the registry, falling back to the primary DB.
-func (h *Handler) lookupRoleID(ctx context.Context, name string) (int16, bool, error) {
-	if id, ok := h.registry.ResolveRole(name); ok {
-		return id, true, nil
-	}
-	id, found, err := h.store.RoleID(ctx, name)
-	if err != nil {
-		return 0, false, fmt.Errorf("lookup role %s: %w", name, err)
-	}
-	return id, found, nil
 }
 
 func (h *Handler) prepareRoleRemoved(payload []byte) (eventPlan, error) {
@@ -643,28 +648,7 @@ func (h *Handler) prepareRoleRemoved(payload []byte) (eventPlan, error) {
 		apply: func(ctx context.Context, w db.Writer) error {
 			return w.DeleteRole(ctx, evt.RoleName)
 		},
-		after: func(ctx context.Context, _ bool) error {
-			h.registry.RemoveRole(evt.RoleName)
-			return h.flushAll(ctx)
-		},
-	}, nil
-}
-
-func (h *Handler) prepareRoleIDAssigned(payload []byte) (eventPlan, error) {
-	var evt struct {
-		RoleName string `json:"role_name"`
-		ID       int16  `json:"id"`
-	}
-	if err := decodePayload(payload, &evt); err != nil {
-		return eventPlan{}, err
-	}
-
-	// No DB phase: the registry update is an idempotent no-op if already present.
-	return eventPlan{
-		after: func(context.Context, bool) error {
-			h.registry.AddRole(evt.RoleName, evt.ID)
-			return nil
-		},
+		after: func(ctx context.Context, _ bool) error { return h.flushAll(ctx) },
 	}, nil
 }
 
@@ -674,16 +658,14 @@ type rolePermEvent struct {
 	ResourceType string `json:"resource_type"`
 }
 
-func (h *Handler) decodeRolePerm(payload []byte) (roleID, permID int16, err error) {
-	var evt rolePermEvent
-	if err := decodePayload(payload, &evt); err != nil {
-		return 0, 0, err
-	}
-	roleID, err = h.resolveRole(evt.RoleName)
+// rolePermIDsIn resolves the role and permission of a role_permissions event
+// inside its transaction.
+func rolePermIDsIn(ctx context.Context, w db.Writer, evt rolePermEvent) (roleID, permID int16, err error) {
+	roleID, err = roleIDIn(ctx, w, evt.RoleName)
 	if err != nil {
 		return 0, 0, err
 	}
-	permID, err = h.resolvePermission(evt.Action, evt.ResourceType)
+	permID, err = permissionIDIn(ctx, w, evt.Action, evt.ResourceType)
 	if err != nil {
 		return 0, 0, err
 	}
@@ -691,12 +673,16 @@ func (h *Handler) decodeRolePerm(payload []byte) (roleID, permID int16, err erro
 }
 
 func (h *Handler) prepareRolePermAssigned(payload []byte) (eventPlan, error) {
-	roleID, permID, err := h.decodeRolePerm(payload)
-	if err != nil {
+	var evt rolePermEvent
+	if err := decodePayload(payload, &evt); err != nil {
 		return eventPlan{}, err
 	}
 	return eventPlan{
 		apply: func(ctx context.Context, w db.Writer) error {
+			roleID, permID, err := rolePermIDsIn(ctx, w, evt)
+			if err != nil {
+				return err
+			}
 			return w.InsertRolePermission(ctx, roleID, permID)
 		},
 		after: func(ctx context.Context, _ bool) error { return h.flushAll(ctx) },
@@ -704,12 +690,16 @@ func (h *Handler) prepareRolePermAssigned(payload []byte) (eventPlan, error) {
 }
 
 func (h *Handler) prepareRolePermRemoved(payload []byte) (eventPlan, error) {
-	roleID, permID, err := h.decodeRolePerm(payload)
-	if err != nil {
+	var evt rolePermEvent
+	if err := decodePayload(payload, &evt); err != nil {
 		return eventPlan{}, err
 	}
 	return eventPlan{
 		apply: func(ctx context.Context, w db.Writer) error {
+			roleID, permID, err := rolePermIDsIn(ctx, w, evt)
+			if err != nil {
+				return err
+			}
 			return w.DeleteRolePermission(ctx, roleID, permID)
 		},
 		after: func(ctx context.Context, _ bool) error { return h.flushAll(ctx) },

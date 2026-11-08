@@ -13,14 +13,13 @@ import (
 
 type Cache struct {
 	client *redis.Client
-	ttl    time.Duration
 }
 
-func NewCache(addr string, ttl time.Duration) *Cache {
+func NewCache(addr string) *Cache {
 	client := redis.NewClient(&redis.Options{
 		Addr: addr,
 	})
-	return &Cache{client: client, ttl: ttl}
+	return &Cache{client: client}
 }
 
 func (c *Cache) Client() *redis.Client {
@@ -47,12 +46,14 @@ func (c *Cache) Get(ctx context.Context, req model.CheckRequest) (*model.CheckRe
 	return &result, nil
 }
 
-func (c *Cache) Set(ctx context.Context, req model.CheckRequest, result model.CheckResult) error {
+// Set caches a check result for ttl. The caller picks the ttl, so a result
+// never outlives the grant that decided it.
+func (c *Cache) Set(ctx context.Context, req model.CheckRequest, result model.CheckResult, ttl time.Duration) error {
 	data, err := json.Marshal(result)
 	if err != nil {
 		return err
 	}
-	return c.client.Set(ctx, c.checkKey(req), data, c.ttl).Err()
+	return c.client.Set(ctx, c.checkKey(req), data, ttl).Err()
 }
 
 // Invalidate deletes all cached check results for a (user, resource_type, resource_id) triple.

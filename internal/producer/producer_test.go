@@ -109,3 +109,45 @@ func TestPing(t *testing.T) {
 		}
 	})
 }
+
+// TestNewProducer_DLQWriterCreatedOnce covers AC-1: the DLQ writer is built
+// once, next to the main writer, and closed with it.
+func TestNewProducer_DLQWriterCreatedOnce(t *testing.T) {
+	p := NewProducer("127.0.0.1:1,127.0.0.1:2", "authz.permission-events")
+
+	if p.dlqWriter == nil {
+		t.Fatal("DLQ writer not created by NewProducer")
+	}
+	if p.dlqWriter.Topic != "authz.permission-events.dlq" {
+		t.Errorf("DLQ writer topic = %q, want authz.permission-events.dlq", p.dlqWriter.Topic)
+	}
+	if p.writer.Topic != "authz.permission-events" {
+		t.Errorf("main writer topic = %q", p.writer.Topic)
+	}
+	if p.dlqWriter.Addr.String() != p.writer.Addr.String() {
+		t.Errorf("DLQ writer brokers %q differ from main writer %q", p.dlqWriter.Addr, p.writer.Addr)
+	}
+	if p.dlqWriter == p.writer {
+		t.Error("DLQ writer must be a separate writer")
+	}
+
+	// A failed publish must not replace the writer: the same instance serves
+	// every call.
+	before := p.dlqWriter
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	if err := p.PublishDLQ(ctx, "evt-1", map[string]string{"k": "v"}); err == nil {
+		t.Fatal("PublishDLQ to an unreachable broker succeeded")
+	}
+	if p.dlqWriter != before {
+		t.Error("PublishDLQ replaced the DLQ writer")
+	}
+
+	if err := p.Close(); err != nil {
+		t.Fatalf("Close = %v", err)
+	}
+	// kafka.Writer.WriteMessages on a closed writer fails with io.ErrClosedPipe.
+	if err := p.PublishDLQ(context.Background(), "evt-2", map[string]string{"k": "v"}); err == nil {
+		t.Error("PublishDLQ after Close succeeded; Close must close the DLQ writer")
+	}
+}

@@ -983,7 +983,7 @@ const docTemplate = `{
         },
         "/readyz": {
             "get": {
-                "description": "Checks DB, Redis, registry, and Kafka (if admin mode). Returns 503 if any check fails.",
+                "description": "Checks DB, Redis, registry, that the Kafka topic exists, and Kafka broker reachability (if admin mode). Returns 503 if any check fails.",
                 "produces": [
                     "application/json"
                 ],

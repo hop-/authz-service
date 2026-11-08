@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"log"
 	"log/slog"
@@ -17,6 +16,7 @@ import (
 	"authz-service/internal/cache"
 	"authz-service/internal/config"
 	"authz-service/internal/db"
+	"authz-service/internal/kafkatopics"
 	"authz-service/internal/producer"
 	"authz-service/internal/registry"
 	"authz-service/internal/resolver"
@@ -25,7 +25,6 @@ import (
 
 	"github.com/hop-/goconfig"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
-	"github.com/segmentio/kafka-go"
 )
 
 func main() {
@@ -45,9 +44,14 @@ func main() {
 	if cfg.AdminMode && cfg.AdminToken == "" {
 		log.Fatal("ADMIN_TOKEN is required when ADMIN_MODE=true")
 	}
-	if cfg.AdminMode && cfg.KafkaBrokers == "" {
-		log.Fatal("KAFKA_BROKERS is required when ADMIN_MODE=true")
+	// The registry syncer consumes the event topic in every mode.
+	if cfg.KafkaBrokers == "" {
+		log.Fatal("KAFKA_BROKERS is required")
 	}
+	if cfg.RegistryReloadSecs <= 0 {
+		log.Fatal("REGISTRY_RELOAD_SECONDS must be positive")
+	}
+	brokers := strings.Split(cfg.KafkaBrokers, ",")
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -64,10 +68,10 @@ func main() {
 
 	// 5. Create Redis client
 	cacheTTL := time.Duration(cfg.CacheTTLSeconds) * time.Second
-	redisCache := cache.NewCache(cfg.RedisAddr, cacheTTL)
+	redisCache := cache.NewCache(cfg.RedisAddr)
 	defer redisCache.Close()
 
-	// 6. Load registry from DB
+	// 6. Load registry from DB (fail fast if the first load fails)
 	queries := db.NewQueries(pool)
 	reg, err := registry.New(ctx, queries)
 	if err != nil {
@@ -79,7 +83,7 @@ func main() {
 	)
 
 	// 7. Create resolver
-	res := resolver.NewResolver(redisCache, queries, reg)
+	res := resolver.NewResolver(redisCache, queries, reg, cacheTTL)
 
 	// 8. If AdminMode: create Kafka producer
 	var prod *producer.Producer
@@ -89,47 +93,25 @@ func main() {
 		slog.Info("admin mode enabled, kafka producer created")
 	}
 
-	// 9. Start registry Kafka consumer (background goroutine)
-	if cfg.KafkaBrokers != "" {
-		hostname, _ := os.Hostname()
-		groupID := "authz-api-registry-" + hostname
-		brokers := strings.Split(cfg.KafkaBrokers, ",")
-
-		go func() {
-			reader := kafka.NewReader(kafka.ReaderConfig{
-				Brokers:  brokers,
-				Topic:    cfg.KafkaTopic,
-				GroupID:  groupID,
-				MinBytes: 1,
-				MaxBytes: 10e6,
-			})
-			defer reader.Close()
-
-			for {
-				msg, err := reader.FetchMessage(ctx)
-				if err != nil {
-					if ctx.Err() != nil {
-						return
-					}
-					slog.Error("registry consumer: fetch error", "error", err)
-					continue
-				}
-
-				handleRegistryEvent(reg, msg)
-
-				if err := reader.CommitMessages(ctx, msg); err != nil {
-					slog.Error("registry consumer: commit error", "error", err)
-				}
-			}
-		}()
-	}
+	// 9. Start the registry syncer (no consumer group; see registry.Syncer)
+	syncer := registry.NewSyncer(brokers, cfg.KafkaTopic, reg, queries,
+		time.Duration(cfg.RegistryReloadSecs)*time.Second)
+	syncerDone := make(chan struct{})
+	go func() {
+		defer close(syncerDone)
+		if err := syncer.Run(ctx); err != nil && ctx.Err() == nil {
+			slog.Error("registry syncer stopped", "error", err)
+		}
+	}()
 
 	// 10. Setup health checks
 	health := &api.HealthHandler{
-		DB:        queries,
-		Cache:     redisCache,
-		Registry:  reg,
-		AdminMode: cfg.AdminMode,
+		DB:         queries,
+		Cache:      redisCache,
+		Registry:   reg,
+		Topics:     kafkatopics.Checker{Brokers: brokers},
+		KafkaTopic: cfg.KafkaTopic,
+		AdminMode:  cfg.AdminMode,
 	}
 	if prod != nil {
 		health.Kafka = prod
@@ -192,67 +174,11 @@ func main() {
 	if err := metricsServer.Shutdown(shutdownCtx); err != nil {
 		slog.Error("metrics server shutdown error", "error", err)
 	}
+	select {
+	case <-syncerDone:
+	case <-shutdownCtx.Done():
+		slog.Error("registry syncer did not stop before the shutdown timeout")
+	}
 
 	slog.Info("authz-api stopped")
-}
-
-func handleRegistryEvent(reg *registry.Registry, msg kafka.Message) {
-	var env struct {
-		Event string `json:"event"`
-	}
-	if err := json.Unmarshal(msg.Value, &env); err != nil {
-		slog.Error("registry consumer: unmarshal error", "error", err)
-		return
-	}
-
-	switch env.Event {
-	case "action.registered", "role.created":
-		// No-op - wait for *.id.assigned
-	case "action.id.assigned":
-		var evt struct {
-			Action       string `json:"action"`
-			ResourceType string `json:"resource_type"`
-			ID           int16  `json:"id"`
-		}
-		if err := json.Unmarshal(msg.Value, &evt); err != nil {
-			slog.Error("registry consumer: unmarshal action.id.assigned", "error", err)
-			return
-		}
-		reg.AddPermission(evt.Action, evt.ResourceType, evt.ID)
-		slog.Info("registry: added permission", "action", evt.Action, "resource_type", evt.ResourceType)
-	case "action.removed":
-		var evt struct {
-			Action       string `json:"action"`
-			ResourceType string `json:"resource_type"`
-		}
-		if err := json.Unmarshal(msg.Value, &evt); err != nil {
-			slog.Error("registry consumer: unmarshal action.removed", "error", err)
-			return
-		}
-		reg.RemovePermission(evt.Action, evt.ResourceType)
-		slog.Info("registry: removed permission", "action", evt.Action, "resource_type", evt.ResourceType)
-	case "role.id.assigned":
-		var evt struct {
-			RoleName string `json:"role_name"`
-			ID       int16  `json:"id"`
-		}
-		if err := json.Unmarshal(msg.Value, &evt); err != nil {
-			slog.Error("registry consumer: unmarshal role.id.assigned", "error", err)
-			return
-		}
-		reg.AddRole(evt.RoleName, evt.ID)
-		slog.Info("registry: added role", "role_name", evt.RoleName)
-	case "role.removed":
-		var evt struct {
-			RoleName string `json:"role_name"`
-		}
-		if err := json.Unmarshal(msg.Value, &evt); err != nil {
-			slog.Error("registry consumer: unmarshal role.removed", "error", err)
-			return
-		}
-		reg.RemoveRole(evt.RoleName)
-		slog.Info("registry: removed role", "role_name", evt.RoleName)
-	default:
-		// Ignore other event types
-	}
 }
