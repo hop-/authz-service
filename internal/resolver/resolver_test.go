@@ -67,6 +67,13 @@ type resourcesCall struct {
 	scopeFilter  map[string]string
 }
 
+type filterCall struct {
+	userID       uuid.UUID
+	permissionID int16
+	resourceType string
+	candidates   []string
+}
+
 type listCall struct {
 	userID                   uuid.UUID
 	resourceType, resourceID string
@@ -83,6 +90,9 @@ type fakeStore struct {
 	resourceIDs  []string
 	resourcesErr error
 
+	filterIDs []string
+	filterErr error
+
 	grants      []model.RoleGrant
 	grantsErr   error
 	overrides   []model.OverrideGrant
@@ -91,6 +101,7 @@ type fakeStore struct {
 	overrideCalls  int
 	roleCalls      int
 	resourcesCalls []resourcesCall
+	filterCalls    []filterCall
 	grantCalls     []listCall
 	overrideLists  []listCall
 }
@@ -108,6 +119,11 @@ func (s *fakeStore) CheckRole(_ context.Context, _ uuid.UUID, _ int16, _, _ stri
 func (s *fakeStore) Resources(_ context.Context, userID uuid.UUID, permissionID int16, resourceType string, scopeFilter map[string]string) ([]string, error) {
 	s.resourcesCalls = append(s.resourcesCalls, resourcesCall{userID, permissionID, resourceType, scopeFilter})
 	return s.resourceIDs, s.resourcesErr
+}
+
+func (s *fakeStore) FilterResources(_ context.Context, userID uuid.UUID, permissionID int16, resourceType string, candidates []string) ([]string, error) {
+	s.filterCalls = append(s.filterCalls, filterCall{userID, permissionID, resourceType, slices.Clone(candidates)})
+	return s.filterIDs, s.filterErr
 }
 
 func (s *fakeStore) UserRoleGrants(_ context.Context, userID uuid.UUID, resourceType, resourceID string) ([]model.RoleGrant, error) {
@@ -545,10 +561,48 @@ func TestList_Merge(t *testing.T) {
 			if got == nil {
 				t.Fatal("List must never return nil")
 			}
-			if !reflect.DeepEqual(got, tt.want) {
-				t.Fatalf("got  %+v\nwant %+v", got, tt.want)
+			// An unscoped grant is reported with an empty scope, never nil (008 F-009).
+			want := slices.Clone(tt.want)
+			for i := range want {
+				if want[i].Scope == nil {
+					want[i].Scope = map[string]string{}
+				}
+			}
+			if !reflect.DeepEqual(got, want) {
+				t.Fatalf("got  %+v\nwant %+v", got, want)
 			}
 		})
+	}
+}
+
+// 008 F-009: /permissions must return "scope": {} for unscoped grants, not null.
+func TestList_UnscopedGrantSerializesEmptyScope(t *testing.T) {
+	s := &fakeStore{
+		grants: []model.RoleGrant{{Action: "read", ResourceType: "document", ResourceID: "d1", RoleName: "viewer"}},
+		overrides: []model.OverrideGrant{
+			{Action: "write", ResourceType: "document", ResourceID: "d1", Effect: model.EffectAllow},
+		},
+	}
+	res := NewResolver(newFakeCache(), s, newRegistry(), testTTL)
+	got, err := res.List(context.Background(), testUser, "", "")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("got %d entries, want 2", len(got))
+	}
+	for _, e := range got {
+		b, err := json.Marshal(e)
+		if err != nil {
+			t.Fatalf("marshal: %v", err)
+		}
+		var m map[string]json.RawMessage
+		if err := json.Unmarshal(b, &m); err != nil {
+			t.Fatalf("unmarshal: %v", err)
+		}
+		if string(m["scope"]) != "{}" {
+			t.Errorf("%s entry scope = %s, want {}", e.Source, m["scope"])
+		}
 	}
 }
 
@@ -658,30 +712,76 @@ func TestResources(t *testing.T) {
 
 func TestFilter(t *testing.T) {
 	t.Run("unknown permission", func(t *testing.T) {
-		res := NewResolver(newFakeCache(), &fakeStore{}, registry.NewEmpty(), testTTL)
+		s := &fakeStore{}
+		res := NewResolver(newFakeCache(), s, registry.NewEmpty(), testTTL)
 		_, err := res.Filter(context.Background(), testUser, "read", "document", []string{"d1"})
 		if !errors.Is(err, model.ErrUnknownPermission) {
 			t.Fatalf("expected ErrUnknownPermission, got %v", err)
 		}
+		if len(s.filterCalls) != 0 {
+			t.Fatal("unknown permission must not query the DB")
+		}
 	})
 
-	t.Run("intersection keeps candidate order", func(t *testing.T) {
-		s := &fakeStore{resourceIDs: []string{"d3", "d1", "d9"}}
+	t.Run("checks only the candidates, in SQL", func(t *testing.T) {
+		s := &fakeStore{filterIDs: []string{"d3", "d1"}}
 		res := NewResolver(newFakeCache(), s, newRegistry(), testTTL)
-		got, err := res.Filter(context.Background(), testUser, "read", "document", []string{"d1", "d2", "d3"})
+		candidates := []string{"d1", "d2", "d3"}
+		if _, err := res.Filter(context.Background(), testUser, "read", "document", candidates); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		want := []filterCall{{testUser, 1, "document", candidates}}
+		if !reflect.DeepEqual(s.filterCalls, want) {
+			t.Fatalf("FilterResources calls = %+v, want %+v", s.filterCalls, want)
+		}
+		if len(s.resourcesCalls) != 0 {
+			t.Fatalf("Filter must not load every resource the user has, got Resources calls %+v", s.resourcesCalls)
+		}
+	})
+
+	t.Run("keeps candidate order whatever the DB order", func(t *testing.T) {
+		s := &fakeStore{filterIDs: []string{"d9", "d3", "d1"}}
+		res := NewResolver(newFakeCache(), s, newRegistry(), testTTL)
+		got, err := res.Filter(context.Background(), testUser, "read", "document", []string{"d3", "d2", "d1", "d9"})
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
-		if !slices.Equal(got, []string{"d1", "d3"}) {
-			t.Fatalf("got %v, want [d1 d3]", got)
+		if !slices.Equal(got, []string{"d3", "d1", "d9"}) {
+			t.Fatalf("got %v, want [d3 d1 d9]", got)
 		}
-		if len(s.resourcesCalls) != 1 || s.resourcesCalls[0].scopeFilter != nil {
-			t.Fatalf("expected one unscoped Resources call, got %+v", s.resourcesCalls)
+	})
+
+	t.Run("duplicate candidates are kept", func(t *testing.T) {
+		s := &fakeStore{filterIDs: []string{"d1"}}
+		res := NewResolver(newFakeCache(), s, newRegistry(), testTTL)
+		got, err := res.Filter(context.Background(), testUser, "read", "document", []string{"d1", "d2", "d1"})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !slices.Equal(got, []string{"d1", "d1"}) {
+			t.Fatalf("got %v, want [d1 d1]", got)
+		}
+	})
+
+	t.Run("no candidates: empty slice, no DB query", func(t *testing.T) {
+		s := &fakeStore{}
+		res := NewResolver(newFakeCache(), s, newRegistry(), testTTL)
+		for _, candidates := range [][]string{nil, {}} {
+			got, err := res.Filter(context.Background(), testUser, "read", "document", candidates)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got == nil || len(got) != 0 {
+				t.Fatalf("expected empty non-nil slice, got %#v", got)
+			}
+		}
+		if len(s.filterCalls) != 0 {
+			t.Fatalf("no candidates must not query the DB, got %+v", s.filterCalls)
 		}
 	})
 
 	t.Run("no match is an empty slice", func(t *testing.T) {
-		res := NewResolver(newFakeCache(), &fakeStore{resourceIDs: []string{"d9"}}, newRegistry(), testTTL)
+		res := NewResolver(newFakeCache(), &fakeStore{}, newRegistry(), testTTL)
 		got, err := res.Filter(context.Background(), testUser, "read", "document", []string{"d1"})
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
@@ -693,7 +793,7 @@ func TestFilter(t *testing.T) {
 
 	t.Run("db error", func(t *testing.T) {
 		dbErr := errors.New("db down")
-		res := NewResolver(newFakeCache(), &fakeStore{resourcesErr: dbErr}, newRegistry(), testTTL)
+		res := NewResolver(newFakeCache(), &fakeStore{filterErr: dbErr}, newRegistry(), testTTL)
 		_, err := res.Filter(context.Background(), testUser, "read", "document", []string{"d1"})
 		if !errors.Is(err, dbErr) {
 			t.Fatalf("expected DB error, got %v", err)

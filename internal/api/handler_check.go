@@ -41,6 +41,7 @@ func handleCheck(res *resolver.Resolver) http.HandlerFunc {
 			writeError(w, http.StatusBadRequest, "invalid_request", "user_id must be a valid UUID")
 			return
 		}
+		r = withUserID(r, userID)
 
 		req := model.CheckRequest{
 			UserID:       userID,

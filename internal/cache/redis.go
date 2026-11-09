@@ -3,7 +3,7 @@ package cache
 import (
 	"context"
 	"encoding/json"
-	"fmt"
+	"strings"
 	"time"
 
 	"authz-service/internal/model"
@@ -26,9 +26,36 @@ func (c *Cache) Client() *redis.Client {
 	return c.client
 }
 
+// checkKeyPrefix starts every check-cache key.
+const checkKeyPrefix = "authz:check:"
+
+// keyEscaper escapes one key component, so ":" only ever separates
+// components and no two requests share a key.
+var keyEscaper = strings.NewReplacer(`\`, `\\`, `:`, `\:`)
+
+// globEscaper escapes Redis glob metacharacters in an already key-escaped
+// component, so a SCAN pattern matches it literally.
+var globEscaper = strings.NewReplacer(`\`, `\\`, `*`, `\*`, `?`, `\?`, `[`, `\[`, `]`, `\]`)
+
+// checkKey is authz:check:{user}:{resource_type}:{resource_id}:{action},
+// each component escaped (\ → \\, : → \:).
 func (c *Cache) checkKey(req model.CheckRequest) string {
-	return fmt.Sprintf("authz:check:%s:%s:%s:%s",
-		req.UserID, req.ResourceType, req.ResourceID, req.Action)
+	return checkKeyPrefix + strings.Join([]string{
+		keyEscaper.Replace(req.UserID.String()),
+		keyEscaper.Replace(req.ResourceType),
+		keyEscaper.Replace(req.ResourceID),
+		keyEscaper.Replace(req.Action),
+	}, ":")
+}
+
+// invalidatePattern is the SCAN pattern for every action cached on one
+// (user, resource_type, resource_id): its components match literally.
+func invalidatePattern(userID, resourceType, resourceID string) string {
+	parts := []string{userID, resourceType, resourceID}
+	for i, p := range parts {
+		parts[i] = globEscaper.Replace(keyEscaper.Replace(p))
+	}
+	return checkKeyPrefix + strings.Join(parts, ":") + ":*"
 }
 
 func (c *Cache) Get(ctx context.Context, req model.CheckRequest) (*model.CheckResult, error) {
@@ -59,7 +86,7 @@ func (c *Cache) Set(ctx context.Context, req model.CheckRequest, result model.Ch
 // Invalidate deletes all cached check results for a (user, resource_type, resource_id) triple.
 // Uses SCAN + DEL — never KEYS.
 func (c *Cache) Invalidate(ctx context.Context, userID, resourceType, resourceID string) error {
-	pattern := fmt.Sprintf("authz:check:%s:%s:%s:*", userID, resourceType, resourceID)
+	pattern := invalidatePattern(userID, resourceType, resourceID)
 	var cursor uint64
 	for {
 		keys, nextCursor, err := c.client.Scan(ctx, cursor, pattern, 500).Result()
@@ -82,7 +109,7 @@ func (c *Cache) Invalidate(ctx context.Context, userID, resourceType, resourceID
 // FlushAll deletes all authz check cache entries using SCAN + DEL.
 // Never calls FLUSHDB — safe on shared Redis instances.
 func (c *Cache) FlushAll(ctx context.Context) error {
-	pattern := "authz:check:*"
+	pattern := checkKeyPrefix + "*"
 	var cursor uint64
 	for {
 		keys, nextCursor, err := c.client.Scan(ctx, cursor, pattern, 500).Result()

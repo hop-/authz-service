@@ -49,7 +49,34 @@ cp .env.dist .env.api
 docker compose up -d
 ```
 
-TODO: add migration instructions
+## Migrations
+
+Schema migrations live in `migrations/` as [golang-migrate](https://github.com/golang-migrate/migrate) files (`NNN_name.up.sql` / `NNN_name.down.sql`). Always run them against the **primary** database, never a replica.
+
+**With compose**, the `migrate` service applies every pending `up` migration before `api` and `worker` start (`docker compose up -d` runs it).
+
+**Manually**, with the `migrate` CLI (or the `Dockerfile.migrate` image):
+
+```bash
+# PRIMARY_DATABASE_URL is the primary's URL, e.g. postgres://authz:authz@localhost:5432/authz?sslmode=disable
+migrate -path migrations -database "$PRIMARY_DATABASE_URL" up
+
+# Roll back the last N migrations (here: 004 and 003), or check the current version
+migrate -path migrations -database "$PRIMARY_DATABASE_URL" down 2
+migrate -path migrations -database "$PRIMARY_DATABASE_URL" version
+```
+
+- **`CONCURRENTLY` index migrations** (`003_user_roles_lookup_index`, `004_event_log_processed_at_index`) build their index without blocking writes. `CREATE/DROP INDEX CONCURRENTLY` can't run inside a transaction, so each of these files holds exactly one statement and must never be wrapped in `BEGIN`/`COMMIT` or merged with other statements.
+- **A failed concurrent build leaves an `INVALID` index**, and `IF NOT EXISTS` then skips it. Drop it and run the migration again:
+
+  ```sql
+  -- find invalid indexes
+  SELECT indexrelid::regclass FROM pg_index WHERE NOT indisvalid;
+  DROP INDEX CONCURRENTLY IF EXISTS idx_user_roles_lookup;
+  ```
+
+  If golang-migrate marked the version dirty, reset it with `migrate ... force <previous version>` before re-running `up`.
+- **`002_seed` down** removes only the seeded roles (`viewer`, `editor`, `admin`), permissions (`read`/`write`/`delete` on `document`) and their pairs. Foreign keys cascade: removing a seeded role also removes its user assignments, and removing a seeded permission removes every role pair and override that uses it.
 
 ## API
 
@@ -70,6 +97,11 @@ Returns the user's **effective** permissions: exactly the entries `/query/v1/che
 - A role grants a permission only on assignments whose `resource_type` matches the permission's resource type.
 - A key with an active `DENY` override is omitted. `DENY` entries are never returned.
 - `source` is `allow_override` for an active `ALLOW` override (it wins over roles, and carries the override's scope), otherwise `role:<name>`. When several roles grant the same key, the lexicographically smallest role name is reported.
+- `scope` is the deciding grant's scope, `{}` when it has none.
+
+#### `POST /query/v1/resources/filter` semantics
+
+Returns `allowed_ids`: the candidates (at most 1000) the user has the action on, in the order given. Only the candidates are checked in the database, so the cost grows with the candidate count, not with the user's grants.
 
 ### Admin (`ADMIN_MODE=true`, requires `X-Admin-Token` header)
 
@@ -109,6 +141,38 @@ go run github.com/swaggo/swag/cmd/swag@v1.16.6 init -g cmd/api/main.go -o docs/ 
 
 The generated spec files live in `docs/` (`swagger.json`, `swagger.yaml`). These are committed so the API image serves them without needing the `swag` CLI at runtime.
 
+## Observability
+
+### Metrics
+
+Both binaries serve Prometheus metrics on `METRICS_PORT` (default `3001`) at `/metrics`, next to the Go runtime defaults. Every label value comes from a fixed set.
+
+| Metric | Type | Labels | Binary |
+| --- | --- | --- | --- |
+| `authz_check_total` | counter | `result` (`allowed`, `denied`, `unknown`), `source` | api |
+| `authz_check_duration_seconds` | histogram | `source` | api |
+| `authz_cache_hit_total`, `authz_cache_miss_total` | counter | — | api |
+| `authz_registry_size` | gauge | `type` (`permissions`, `roles`) | api |
+| `authz_registry_updates_total` | counter | `event_type` (registry events, `reload` for a full reload) | api |
+| `authz_db_pool_total_conns`, `authz_db_pool_idle_conns`, `authz_db_pool_acquired_conns` | gauge | — | api, worker |
+| `authz_worker_events_processed_total` | counter | `event_type`, `status` (`ok`, `duplicate`, `dlq`) | worker |
+| `authz_worker_processing_duration_seconds` | histogram | `event_type` | worker |
+| `authz_event_log_deleted_total` | counter | — | worker |
+
+- `source` is the deciding category: `cache`, `deny_override`, `allow_override`, `role`, `default_deny`, or `unknown_permission` (with `result="unknown"`). It never contains a role name. Checks that fail with a database error are not counted.
+- `event_type` is one of the published event types, or `unknown`. Events aborted by shutdown are not counted.
+
+### Logs
+
+Both binaries write JSON logs to stdout. Every entry has `service` (`authz-api` or `authz-worker`).
+
+- **HTTP:** every request is logged with `request_id` (the `X-Request-ID` header, or a generated UUID v7 that is also returned in the response header), `method`, `path`, `status` and `duration_ms`, plus `user_id` once the handler has parsed it.
+- **Worker:** every entry about an event has `event_id` and `event_type`, plus `user_id` for per-user events.
+
+### Shutdown
+
+On SIGTERM the worker stops fetching, finishes the event it is processing (up to 10 s), and commits its offset; past 10 s it abandons the event uncommitted, so it is redelivered. Leaving the consumer group takes a few more seconds, so give the container 30 s to stop (compose sets `stop_grace_period: 30s`; Docker's default of 10 s would kill it mid-drain).
+
 ## Configuration
 
 | Variable | Required | Default | Description |
@@ -124,6 +188,14 @@ The generated spec files live in `docs/` (`swagger.json`, `swagger.yaml`). These
 | `CACHE_TTL_SECONDS` | no | `300` | Maximum Redis cache TTL. A result decided by an expiring role or override is cached at most until that grant expires, and not at all with under 1 s left. |
 | `DB_MAX_CONNS` | no | `20` | Max DB pool connections |
 | `REGISTRY_RELOAD_SECONDS` | no | `300` | API: interval between registry reloads from the database |
+| `DB_ACQUIRE_TIMEOUT_SECS` | no | `2` | Longest wait for a DB pool connection before a query fails |
+| `EVENT_LOG_RETENTION_HOURS` | no | `24` | Worker: delete `event_log` rows processed more than this many hours ago (every 15 min, 5000 rows per batch, one worker at a time). `0` disables the cleanup. |
+
+### `event_log` retention and replays
+
+`event_log` records every event id the worker has applied. It is the worker's deduplication marker, committed with each event's changes, not an audit log. The cleanup keeps it to about `EVENT_LOG_RETENTION_HOURS` of events.
+
+**Replay DLQ messages and reset consumer offsets only within the retention window.** An event whose `event_log` row was already deleted is applied again when it is redelivered. If replays can take longer, raise `EVENT_LOG_RETENTION_HOURS` (or set it to `0`).
 
 ## Permission Model
 

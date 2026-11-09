@@ -1,3 +1,6 @@
+> **Historical: the original v2 design.** Superseded by the code, README and
+> ai-docs plans 007–009; not maintained.
+
 # authz-service — LLM code-generation specification
 
 > **How to use this document.** This is a structured prompt for one or more LLM agents to generate production-quality Go code for the `authz-service`. Each numbered section maps to one or more output files. Sections are self-contained: an agent assigned a section only needs the sections listed in its **Depends on** line plus the global rules in §2.

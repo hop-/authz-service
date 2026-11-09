@@ -63,7 +63,7 @@ type env struct {
 func newEnv(t *testing.T) env {
 	t.Helper()
 	ctx := context.Background()
-	q := db.NewQueries(pool)
+	q := db.NewQueries(pool, testinfra.AcquireTimeout)
 	reg, err := registry.New(ctx, q)
 	if err != nil {
 		t.Fatalf("registry: %v", err)

@@ -84,7 +84,7 @@ type workerProc struct {
 
 func startWorker(t *testing.T, ctx context.Context, topic, group, id string) *workerProc {
 	t.Helper()
-	q := db.NewQueries(pool)
+	q := db.NewQueries(pool, testinfra.AcquireTimeout)
 	c := cache.NewCache(redisAddr)
 	prod := producer.NewProducer(strings.Join(brokers, ","), topic)
 	h := worker.NewHandler(q, c, prod, id)
@@ -299,6 +299,9 @@ func TestWorker_RoleAssignedWritesRowAndInvalidatesScope(t *testing.T) {
 	}
 }
 
+// TestWorker_DuplicateEventRunsFollowUpsOnly redelivers an override.set whose
+// payload differs (set_by, reason). Its upsert would overwrite the row if it
+// ran again, so an unchanged row proves the dedup skipped the write (008 F-006).
 func TestWorker_DuplicateEventRunsFollowUpsOnly(t *testing.T) {
 	topic := uniq("e2e.dup")
 	testinfra.CreateTopics(t, brokers, topic, topic+".dlq")
@@ -306,44 +309,60 @@ func TestWorker_DuplicateEventRunsFollowUpsOnly(t *testing.T) {
 	w := startWorker(t, ctx, topic, uniq("group"), "w1")
 	pub := newPublisher(t, topic)
 	user := uuid.New()
-	evt := roleAssigned(user, "viewer", "d1")
+	otherActor := uuid.New()
+	evt := producer.NewEventEnvelope("override.set")
+	evt["user_id"] = user.String()
+	evt["action"], evt["resource_type"], evt["resource_id"] = "read", "document", "d1"
+	evt["scope"] = map[string]string{}
+	evt["effect"], evt["reason"], evt["set_by"] = "DENY", "first", actor.String()
+	evt["expires_at"] = nil
 	eventID := evt["event_id"].(string)
 	key := cacheKey(user, "d1", "read")
 
+	readOverride := func() (setBy uuid.UUID, reason string) {
+		t.Helper()
+		if err := pool.QueryRow(ctx, `SELECT set_by, reason FROM user_permission_overrides WHERE user_id = $1`, user).
+			Scan(&setBy, &reason); err != nil {
+			t.Fatalf("read override: %v", err)
+		}
+		return setBy, reason
+	}
+	overrideCount := func() int {
+		return countRows(t, `SELECT count(*) FROM user_permission_overrides WHERE user_id = $1`, user)
+	}
+
 	publish(t, pub, user.String(), evt)
-	eventually(t, "first delivery applied", func() bool { return userRoleCount(t, user, "d1") == 1 })
+	eventually(t, "first delivery applied", func() bool { return overrideCount() == 1 })
 	eventually(t, "cache invalidated", func() bool { return !keyExists(t, w.cache, key) })
+	if setBy, reason := readOverride(); setBy != actor || reason != "first" {
+		t.Fatalf("first delivery stored set_by %s reason %q", setBy, reason)
+	}
 
 	// A stale entry cached after the first delivery; the redelivery must
 	// invalidate it again without touching the DB.
 	setKey(t, w.cache, key)
-	var grantedBefore time.Time
-	if err := pool.QueryRow(ctx, `SELECT granted_at FROM user_roles WHERE user_id = $1`, user).Scan(&grantedBefore); err != nil {
-		t.Fatalf("read row: %v", err)
+	dup := make(map[string]interface{}, len(evt))
+	for k, v := range evt {
+		dup[k] = v
 	}
-	publish(t, pub, user.String(), evt)
+	dup["set_by"], dup["reason"] = otherActor.String(), "second" // same event_id
+	publish(t, pub, user.String(), dup)
 
 	eventually(t, "duplicate's follow-up invalidation", func() bool { return !keyExists(t, w.cache, key) })
-	if n := userRoleCount(t, user, "d1"); n != 1 {
-		t.Errorf("user_roles rows = %d, want 1", n)
+	if n := overrideCount(); n != 1 {
+		t.Errorf("override rows = %d, want 1", n)
 	}
 	if n := countRows(t, `SELECT count(*) FROM event_log WHERE event_id = $1`, eventID); n != 1 {
 		t.Errorf("event_log rows = %d, want 1", n)
 	}
-	var grantedAfter time.Time
-	if err := pool.QueryRow(ctx, `SELECT granted_at FROM user_roles WHERE user_id = $1`, user).Scan(&grantedAfter); err != nil {
-		t.Fatalf("read row: %v", err)
-	}
-	if !grantedAfter.Equal(grantedBefore) {
-		t.Error("duplicate event rewrote the row")
+	if setBy, reason := readOverride(); setBy != actor || reason != "first" {
+		t.Errorf("duplicate event rewrote the row: set_by %s reason %q, want %s \"first\"", setBy, reason, actor)
 	}
 }
 
-// createRoleInDB creates a role the way the worker's DB phase does, with no
-// event on the topic.
 func createRoleInDB(t *testing.T, name string) int16 {
 	t.Helper()
-	q := db.NewQueries(pool)
+	q := db.NewQueries(pool, testinfra.AcquireTimeout)
 	var id int16
 	applied, err := q.ApplyEvent(context.Background(), uuid.New(), "role.created", func(w db.Writer) error {
 		var err error
@@ -401,7 +420,7 @@ func TestWorker_TwoWorkersMixedStream(t *testing.T) {
 	created := producer.NewEventEnvelope("role.created")
 	created["role_name"] = role
 	publish(t, pub, "registry", created)
-	q := db.NewQueries(pool)
+	q := db.NewQueries(pool, testinfra.AcquireTimeout)
 	eventually(t, "role created by a worker", func() bool {
 		_, found, err := q.RoleID(ctx, role)
 		return err == nil && found
@@ -533,7 +552,7 @@ func TestWorker_RoleRecreatedAppliesAgainstNewID(t *testing.T) {
 	owner := awaitSplitAssignment(t, group, topic)
 	registryOwner := owner[partitionOf("registry")]
 	pub := newPublisher(t, topic)
-	q := db.NewQueries(pool)
+	q := db.NewQueries(pool, testinfra.AcquireTimeout)
 	role := uniq("editor")
 
 	createRole := func() int16 {
@@ -585,6 +604,13 @@ func TestWorker_RoleRecreatedAppliesAgainstNewID(t *testing.T) {
 		_, found, err := q.RoleID(ctx, role)
 		return err == nil && !found
 	})
+	// 008 F-007: removing the role cascaded the first grant away.
+	if n := userRoleCount(t, users[0], "d1"); n != 0 {
+		t.Fatalf("grant with the removed role survived role.removed: %d rows", n)
+	}
+	if n := countRows(t, `SELECT count(*) FROM user_roles WHERE role_id = $1`, oldID); n != 0 {
+		t.Fatalf("rows reference the removed role id %d right after removal: %d", oldID, n)
+	}
 	newID := createRole()
 	if newID == oldID {
 		t.Fatalf("re-created role kept id %d; the test needs a new id", newID)

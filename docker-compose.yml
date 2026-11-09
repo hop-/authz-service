@@ -23,7 +23,7 @@ services:
       POSTGRES_USER: authz
       POSTGRES_PASSWORD: authz
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready", "-d", "localhost"]
+      test: ["CMD-SHELL", "pg_isready -U authz -d authz"]
       interval: 10s
       timeout: 10s
       retries: 20
@@ -84,7 +84,7 @@ services:
 
   kafbat:
     logging: *default-logging
-    image: ghcr.io/kafbat/kafka-ui:latest
+    image: ghcr.io/kafbat/kafka-ui:v1.5.0
     restart: always
     ports:
       - 9080:8080
@@ -117,7 +117,7 @@ services:
     ]
 
   redisinsight:
-    image: redis/redisinsight:latest
+    image: redis/redisinsight:3.8.0
     restart: always
     logging: *default-logging
     container_name: redisinsight
@@ -162,6 +162,9 @@ services:
       context: .
       dockerfile: Dockerfile
       target: worker
+    # The worker drains its in-flight event for up to 10 s on SIGTERM; the
+    # default 10 s grace period would SIGKILL it mid-drain.
+    stop_grace_period: 30s
     env_file:
       - path: .env
         required: false

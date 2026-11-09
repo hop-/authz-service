@@ -35,11 +35,9 @@ func NewAdminHandler(s adminStore, reg *registry.Registry, p publisher) *AdminHa
 	return &AdminHandler{db: s, registry: reg, producer: p}
 }
 
-// parseActor parses a required actor UUID field (granted_by, set_by).
+// parseActor parses a required actor UUID field (granted_by, set_by). An
+// empty value fails to parse, so it is rejected too.
 func parseActor(value string) (uuid.UUID, bool) {
-	if value == "" {
-		return uuid.Nil, false
-	}
 	id, err := uuid.Parse(value)
 	return id, err == nil
 }
@@ -77,7 +75,7 @@ func (h *AdminHandler) ListActions(w http.ResponseWriter, r *http.Request) {
 // @Tags admin-actions
 // @Accept json
 // @Security AdminToken
-// @Param body body object true "Action definition" SchemaExample({"action":"read","resource_type":"project","description":"Read access"})
+// @Param body body CreateActionRequest true "Action definition"
 // @Success 202 "Accepted"
 // @Failure 400 {object} model.ErrorResponse
 // @Failure 401 {object} model.ErrorResponse
@@ -85,11 +83,7 @@ func (h *AdminHandler) ListActions(w http.ResponseWriter, r *http.Request) {
 // @Failure 500 {object} model.ErrorResponse
 // @Router /admin/v1/actions [post]
 func (h *AdminHandler) CreateAction(w http.ResponseWriter, r *http.Request) {
-	var body struct {
-		Action       string `json:"action"`
-		ResourceType string `json:"resource_type"`
-		Description  string `json:"description"`
-	}
+	var body CreateActionRequest
 	if !decodeJSON(w, r, &body) {
 		return
 	}
@@ -178,7 +172,7 @@ func (h *AdminHandler) ListRoles(w http.ResponseWriter, r *http.Request) {
 // @Tags admin-roles
 // @Accept json
 // @Security AdminToken
-// @Param body body object true "Role definition" SchemaExample({"name":"editor","description":"Can edit resources"})
+// @Param body body CreateRoleRequest true "Role definition"
 // @Success 202 "Accepted"
 // @Failure 400 {object} model.ErrorResponse
 // @Failure 401 {object} model.ErrorResponse
@@ -186,10 +180,7 @@ func (h *AdminHandler) ListRoles(w http.ResponseWriter, r *http.Request) {
 // @Failure 500 {object} model.ErrorResponse
 // @Router /admin/v1/roles [post]
 func (h *AdminHandler) CreateRole(w http.ResponseWriter, r *http.Request) {
-	var body struct {
-		Name        string `json:"name"`
-		Description string `json:"description"`
-	}
+	var body CreateRoleRequest
 	if !decodeJSON(w, r, &body) {
 		return
 	}
@@ -253,7 +244,7 @@ func (h *AdminHandler) ListRolePermissions(w http.ResponseWriter, r *http.Reques
 // @Accept json
 // @Security AdminToken
 // @Param name path string true "Role name"
-// @Param body body object true "Permission" SchemaExample({"action":"read","resource_type":"project"})
+// @Param body body RolePermissionRequest true "Permission"
 // @Success 202 "Accepted"
 // @Failure 400 {object} model.ErrorResponse
 // @Failure 401 {object} model.ErrorResponse
@@ -263,10 +254,7 @@ func (h *AdminHandler) ListRolePermissions(w http.ResponseWriter, r *http.Reques
 func (h *AdminHandler) AssignRolePermission(w http.ResponseWriter, r *http.Request) {
 	name := chi.URLParam(r, "name")
 
-	var body struct {
-		Action       string `json:"action"`
-		ResourceType string `json:"resource_type"`
-	}
+	var body RolePermissionRequest
 	if !decodeJSON(w, r, &body) {
 		return
 	}
@@ -348,7 +336,7 @@ func (h *AdminHandler) RemoveRolePermission(w http.ResponseWriter, r *http.Reque
 // @Accept json
 // @Security AdminToken
 // @Param user_id path string true "User UUID"
-// @Param body body object true "Role assignment" SchemaExample({"role_name":"editor","resource_type":"project","resource_id":"proj-1","granted_by":"00000000-0000-0000-0000-000000000001"})
+// @Param body body AssignUserRoleRequest true "Role assignment"
 // @Success 202 "Accepted"
 // @Failure 400 {object} model.ErrorResponse
 // @Failure 401 {object} model.ErrorResponse
@@ -362,15 +350,9 @@ func (h *AdminHandler) AssignUserRole(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_request", "user_id must be a valid UUID")
 		return
 	}
+	r = withUserID(r, userID)
 
-	var body struct {
-		RoleName     string            `json:"role_name"`
-		ResourceType string            `json:"resource_type"`
-		ResourceID   string            `json:"resource_id"`
-		Scope        map[string]string `json:"scope"`
-		GrantedBy    string            `json:"granted_by"`
-		ExpiresAt    *time.Time        `json:"expires_at"`
-	}
+	var body AssignUserRoleRequest
 	if !decodeJSON(w, r, &body) {
 		return
 	}
@@ -435,6 +417,7 @@ func (h *AdminHandler) RevokeUserRole(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_request", "user_id must be a valid UUID")
 		return
 	}
+	r = withUserID(r, userID)
 
 	roleName := chi.URLParam(r, "role_name")
 	resourceType := chi.URLParam(r, "resource_type")
@@ -469,7 +452,7 @@ func (h *AdminHandler) RevokeUserRole(w http.ResponseWriter, r *http.Request) {
 // @Accept json
 // @Security AdminToken
 // @Param user_id path string true "User UUID"
-// @Param body body object true "Override definition" SchemaExample({"action":"write","resource_type":"project","resource_id":"proj-1","effect":"DENY","reason":"suspended","set_by":"00000000-0000-0000-0000-000000000001"})
+// @Param body body SetOverrideRequest true "Override definition"
 // @Success 202 "Accepted"
 // @Failure 400 {object} model.ErrorResponse
 // @Failure 401 {object} model.ErrorResponse
@@ -483,17 +466,9 @@ func (h *AdminHandler) SetOverride(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_request", "user_id must be a valid UUID")
 		return
 	}
+	r = withUserID(r, userID)
 
-	var body struct {
-		Action       string            `json:"action"`
-		ResourceType string            `json:"resource_type"`
-		ResourceID   string            `json:"resource_id"`
-		Scope        map[string]string `json:"scope"`
-		Effect       string            `json:"effect"`
-		Reason       string            `json:"reason"`
-		SetBy        string            `json:"set_by"`
-		ExpiresAt    *time.Time        `json:"expires_at"`
-	}
+	var body SetOverrideRequest
 	if !decodeJSON(w, r, &body) {
 		return
 	}
@@ -564,6 +539,7 @@ func (h *AdminHandler) RemoveOverride(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_request", "user_id must be a valid UUID")
 		return
 	}
+	r = withUserID(r, userID)
 
 	action := chi.URLParam(r, "action")
 	resourceType := chi.URLParam(r, "resource_type")

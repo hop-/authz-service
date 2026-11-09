@@ -75,7 +75,7 @@ const docTemplate = `{
                         "in": "body",
                         "required": true,
                         "schema": {
-                            "type": "object"
+                            "$ref": "#/definitions/internal_api.CreateActionRequest"
                         }
                     }
                 ],
@@ -223,7 +223,7 @@ const docTemplate = `{
                         "in": "body",
                         "required": true,
                         "schema": {
-                            "type": "object"
+                            "$ref": "#/definitions/internal_api.CreateRoleRequest"
                         }
                     }
                 ],
@@ -340,7 +340,7 @@ const docTemplate = `{
                         "in": "body",
                         "required": true,
                         "schema": {
-                            "type": "object"
+                            "$ref": "#/definitions/internal_api.RolePermissionRequest"
                         }
                     }
                 ],
@@ -464,7 +464,7 @@ const docTemplate = `{
                         "in": "body",
                         "required": true,
                         "schema": {
-                            "type": "object"
+                            "$ref": "#/definitions/internal_api.SetOverrideRequest"
                         }
                     }
                 ],
@@ -601,7 +601,7 @@ const docTemplate = `{
                         "in": "body",
                         "required": true,
                         "schema": {
-                            "type": "object"
+                            "$ref": "#/definitions/internal_api.AssignUserRoleRequest"
                         }
                     }
                 ],
@@ -925,7 +925,7 @@ const docTemplate = `{
         },
         "/query/v1/resources/filter": {
             "post": {
-                "description": "Given a list of candidate resource IDs, return only those the user is authorized for.",
+                "description": "Given a list of candidate resource IDs (at most 1000), return only those the user is authorized for, in the candidates' order.",
                 "consumes": [
                     "application/json"
                 ],
@@ -943,7 +943,7 @@ const docTemplate = `{
                         "in": "body",
                         "required": true,
                         "schema": {
-                            "type": "object"
+                            "$ref": "#/definitions/internal_api.FilterRequest"
                         }
                     }
                 ],
@@ -1125,6 +1125,185 @@ const docTemplate = `{
                 },
                 "name": {
                     "type": "string"
+                }
+            }
+        },
+        "internal_api.AssignUserRoleRequest": {
+            "type": "object",
+            "required": [
+                "granted_by",
+                "resource_id",
+                "resource_type",
+                "role_name"
+            ],
+            "properties": {
+                "expires_at": {
+                    "description": "ExpiresAt, if set, must be in the future.",
+                    "type": "string"
+                },
+                "granted_by": {
+                    "description": "GrantedBy is the UUID of the actor granting the role.",
+                    "type": "string",
+                    "format": "uuid",
+                    "example": "00000000-0000-0000-0000-000000000001"
+                },
+                "resource_id": {
+                    "type": "string",
+                    "example": "proj-1"
+                },
+                "resource_type": {
+                    "type": "string",
+                    "example": "project"
+                },
+                "role_name": {
+                    "type": "string",
+                    "example": "editor"
+                },
+                "scope": {
+                    "type": "object",
+                    "additionalProperties": {
+                        "type": "string"
+                    }
+                }
+            }
+        },
+        "internal_api.CreateActionRequest": {
+            "type": "object",
+            "required": [
+                "action",
+                "resource_type"
+            ],
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "example": "read"
+                },
+                "description": {
+                    "type": "string",
+                    "example": "Read access"
+                },
+                "resource_type": {
+                    "type": "string",
+                    "example": "project"
+                }
+            }
+        },
+        "internal_api.CreateRoleRequest": {
+            "type": "object",
+            "required": [
+                "name"
+            ],
+            "properties": {
+                "description": {
+                    "type": "string",
+                    "example": "Can edit resources"
+                },
+                "name": {
+                    "type": "string",
+                    "example": "editor"
+                }
+            }
+        },
+        "internal_api.FilterRequest": {
+            "type": "object",
+            "required": [
+                "action",
+                "resource_type",
+                "user_id"
+            ],
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "example": "read"
+                },
+                "candidate_ids": {
+                    "description": "CandidateIDs holds at most 1000 ids.",
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    },
+                    "example": [
+                        "id1",
+                        "id2"
+                    ]
+                },
+                "resource_type": {
+                    "type": "string",
+                    "example": "project"
+                },
+                "user_id": {
+                    "type": "string",
+                    "format": "uuid",
+                    "example": "00000000-0000-0000-0000-0000000000aa"
+                }
+            }
+        },
+        "internal_api.RolePermissionRequest": {
+            "type": "object",
+            "required": [
+                "action",
+                "resource_type"
+            ],
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "example": "read"
+                },
+                "resource_type": {
+                    "type": "string",
+                    "example": "project"
+                }
+            }
+        },
+        "internal_api.SetOverrideRequest": {
+            "type": "object",
+            "required": [
+                "action",
+                "effect",
+                "resource_id",
+                "resource_type",
+                "set_by"
+            ],
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "example": "write"
+                },
+                "effect": {
+                    "type": "string",
+                    "enum": [
+                        "ALLOW",
+                        "DENY"
+                    ],
+                    "example": "DENY"
+                },
+                "expires_at": {
+                    "description": "ExpiresAt, if set, must be in the future.",
+                    "type": "string"
+                },
+                "reason": {
+                    "type": "string",
+                    "example": "suspended"
+                },
+                "resource_id": {
+                    "type": "string",
+                    "example": "proj-1"
+                },
+                "resource_type": {
+                    "type": "string",
+                    "example": "project"
+                },
+                "scope": {
+                    "type": "object",
+                    "additionalProperties": {
+                        "type": "string"
+                    }
+                },
+                "set_by": {
+                    "description": "SetBy is the UUID of the actor setting the override.",
+                    "type": "string",
+                    "format": "uuid",
+                    "example": "00000000-0000-0000-0000-000000000001"
                 }
             }
         }

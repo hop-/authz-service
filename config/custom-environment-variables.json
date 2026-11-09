@@ -24,6 +24,9 @@
     "registry": {
       "reloadSecs": "REGISTRY_RELOAD_SECONDS"
     },
+    "eventLog": {
+      "retentionHours": "EVENT_LOG_RETENTION_HOURS"
+    },
     "admin": {
       "enable": "ADMIN_MODE",
       "token": "ADMIN_TOKEN"

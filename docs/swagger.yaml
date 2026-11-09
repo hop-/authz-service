@@ -76,6 +76,137 @@ definitions:
       name:
         type: string
     type: object
+  internal_api.AssignUserRoleRequest:
+    properties:
+      expires_at:
+        description: ExpiresAt, if set, must be in the future.
+        type: string
+      granted_by:
+        description: GrantedBy is the UUID of the actor granting the role.
+        example: 00000000-0000-0000-0000-000000000001
+        format: uuid
+        type: string
+      resource_id:
+        example: proj-1
+        type: string
+      resource_type:
+        example: project
+        type: string
+      role_name:
+        example: editor
+        type: string
+      scope:
+        additionalProperties:
+          type: string
+        type: object
+    required:
+    - granted_by
+    - resource_id
+    - resource_type
+    - role_name
+    type: object
+  internal_api.CreateActionRequest:
+    properties:
+      action:
+        example: read
+        type: string
+      description:
+        example: Read access
+        type: string
+      resource_type:
+        example: project
+        type: string
+    required:
+    - action
+    - resource_type
+    type: object
+  internal_api.CreateRoleRequest:
+    properties:
+      description:
+        example: Can edit resources
+        type: string
+      name:
+        example: editor
+        type: string
+    required:
+    - name
+    type: object
+  internal_api.FilterRequest:
+    properties:
+      action:
+        example: read
+        type: string
+      candidate_ids:
+        description: CandidateIDs holds at most 1000 ids.
+        example:
+        - id1
+        - id2
+        items:
+          type: string
+        type: array
+      resource_type:
+        example: project
+        type: string
+      user_id:
+        example: 00000000-0000-0000-0000-0000000000aa
+        format: uuid
+        type: string
+    required:
+    - action
+    - resource_type
+    - user_id
+    type: object
+  internal_api.RolePermissionRequest:
+    properties:
+      action:
+        example: read
+        type: string
+      resource_type:
+        example: project
+        type: string
+    required:
+    - action
+    - resource_type
+    type: object
+  internal_api.SetOverrideRequest:
+    properties:
+      action:
+        example: write
+        type: string
+      effect:
+        enum:
+        - ALLOW
+        - DENY
+        example: DENY
+        type: string
+      expires_at:
+        description: ExpiresAt, if set, must be in the future.
+        type: string
+      reason:
+        example: suspended
+        type: string
+      resource_id:
+        example: proj-1
+        type: string
+      resource_type:
+        example: project
+        type: string
+      scope:
+        additionalProperties:
+          type: string
+        type: object
+      set_by:
+        description: SetBy is the UUID of the actor setting the override.
+        example: 00000000-0000-0000-0000-000000000001
+        format: uuid
+        type: string
+    required:
+    - action
+    - effect
+    - resource_id
+    - resource_type
+    - set_by
+    type: object
 info:
   contact: {}
 paths:
@@ -115,7 +246,7 @@ paths:
         name: body
         required: true
         schema:
-          type: object
+          $ref: '#/definitions/internal_api.CreateActionRequest'
       responses:
         "202":
           description: Accepted
@@ -209,7 +340,7 @@ paths:
         name: body
         required: true
         schema:
-          type: object
+          $ref: '#/definitions/internal_api.CreateRoleRequest'
       responses:
         "202":
           description: Accepted
@@ -284,7 +415,7 @@ paths:
         name: body
         required: true
         schema:
-          type: object
+          $ref: '#/definitions/internal_api.RolePermissionRequest'
       responses:
         "202":
           description: Accepted
@@ -366,7 +497,7 @@ paths:
         name: body
         required: true
         schema:
-          type: object
+          $ref: '#/definitions/internal_api.SetOverrideRequest'
       responses:
         "202":
           description: Accepted
@@ -459,7 +590,7 @@ paths:
         name: body
         required: true
         schema:
-          type: object
+          $ref: '#/definitions/internal_api.AssignUserRoleRequest'
       responses:
         "202":
           description: Accepted
@@ -688,15 +819,15 @@ paths:
     post:
       consumes:
       - application/json
-      description: Given a list of candidate resource IDs, return only those the user
-        is authorized for.
+      description: Given a list of candidate resource IDs (at most 1000), return only
+        those the user is authorized for, in the candidates' order.
       parameters:
       - description: Filter request
         in: body
         name: body
         required: true
         schema:
-          type: object
+          $ref: '#/definitions/internal_api.FilterRequest'
       produces:
       - application/json
       responses:

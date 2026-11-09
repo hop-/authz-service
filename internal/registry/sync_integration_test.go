@@ -135,7 +135,7 @@ func TestSyncer_NoReplayAndPostCaptureApply(t *testing.T) {
 	topic := itUniq("sync.events")
 	testinfra.CreateTopics(t, itBrokers, topic)
 	pub := itPublisher(t, topic)
-	q := db.NewQueries(itPool)
+	q := db.NewQueries(itPool, testinfra.AcquireTimeout)
 
 	// Published before the syncer starts, for a permission not in the DB:
 	// replaying the topic would add it.
@@ -195,7 +195,7 @@ func TestSyncer_NoReplayAndPostCaptureApply(t *testing.T) {
 func TestSyncer_PeriodicReloadPicksUpDBOnlyChange(t *testing.T) {
 	topic := itUniq("sync.reload")
 	testinfra.CreateTopics(t, itBrokers, topic)
-	q := db.NewQueries(itPool)
+	q := db.NewQueries(itPool, testinfra.AcquireTimeout)
 	reg, err := New(context.Background(), q)
 	if err != nil {
 		t.Fatalf("registry: %v", err)
@@ -221,7 +221,7 @@ func TestSyncer_PeriodicReloadPicksUpDBOnlyChange(t *testing.T) {
 
 func TestSyncer_WaitsForTopic(t *testing.T) {
 	topic := itUniq("sync.late")
-	q := db.NewQueries(itPool)
+	q := db.NewQueries(itPool, testinfra.AcquireTimeout)
 	reg, err := New(context.Background(), q)
 	if err != nil {
 		t.Fatalf("registry: %v", err)
@@ -245,7 +245,7 @@ func TestSyncer_WaitsForTopic(t *testing.T) {
 }
 
 func TestSyncer_CancelDuringTopicWait(t *testing.T) {
-	q := db.NewQueries(itPool)
+	q := db.NewQueries(itPool, testinfra.AcquireTimeout)
 	s := NewSyncer(itBrokers, itUniq("sync.never"), NewEmpty(), q, time.Hour)
 	_, stop := runSyncer(t, s)
 	time.Sleep(500 * time.Millisecond)

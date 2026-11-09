@@ -40,6 +40,7 @@ func handleResources(res *resolver.Resolver) http.HandlerFunc {
 			writeError(w, http.StatusBadRequest, "invalid_request", "user_id must be a valid UUID")
 			return
 		}
+		r = withUserID(r, userID)
 
 		var scopeFilter map[string]string
 		scopeFilterStr := r.URL.Query().Get("scope_filter")
@@ -72,11 +73,11 @@ func handleResources(res *resolver.Resolver) http.HandlerFunc {
 }
 
 // @Summary Filter authorized resource IDs
-// @Description Given a list of candidate resource IDs, return only those the user is authorized for.
+// @Description Given a list of candidate resource IDs (at most 1000), return only those the user is authorized for, in the candidates' order.
 // @Tags query
 // @Accept json
 // @Produce json
-// @Param body body object true "Filter request" SchemaExample({"user_id":"uuid","action":"read","resource_type":"project","candidate_ids":["id1","id2"]})
+// @Param body body FilterRequest true "Filter request"
 // @Success 200 {object} map[string][]string
 // @Failure 400 {object} model.ErrorResponse
 // @Failure 404 {object} model.ErrorResponse
@@ -84,12 +85,7 @@ func handleResources(res *resolver.Resolver) http.HandlerFunc {
 // @Router /query/v1/resources/filter [post]
 func handleFilter(res *resolver.Resolver) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		var body struct {
-			UserID       string   `json:"user_id"`
-			Action       string   `json:"action"`
-			ResourceType string   `json:"resource_type"`
-			CandidateIDs []string `json:"candidate_ids"`
-		}
+		var body FilterRequest
 		if !decodeJSON(w, r, &body) {
 			return
 		}
@@ -104,6 +100,7 @@ func handleFilter(res *resolver.Resolver) http.HandlerFunc {
 			writeError(w, http.StatusBadRequest, "invalid_request", "user_id must be a valid UUID")
 			return
 		}
+		r = withUserID(r, userID)
 
 		if len(body.CandidateIDs) > 1000 {
 			writeError(w, http.StatusBadRequest, "invalid_request", "candidate_ids exceeds limit of 1000")
