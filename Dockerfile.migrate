@@ -1,9 +1,12 @@
 FROM alpine:3.21
 
 ARG MIGRATE_VERSION=v4.18.3
+# Set by BuildKit to the target platform's architecture (amd64, arm64, ...);
+# the default covers builders that don't set it.
+ARG TARGETARCH=amd64
 
 RUN apk add --no-cache curl \
-    && curl -fsSL "https://github.com/golang-migrate/migrate/releases/download/${MIGRATE_VERSION}/migrate.linux-amd64.tar.gz" \
+    && curl -fsSL "https://github.com/golang-migrate/migrate/releases/download/${MIGRATE_VERSION}/migrate.linux-${TARGETARCH}.tar.gz" \
        | tar -xz -C /usr/local/bin \
     && chmod +x /usr/local/bin/migrate \
     && apk del curl

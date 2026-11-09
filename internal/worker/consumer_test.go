@@ -4,9 +4,13 @@ import (
 	"context"
 	"errors"
 	"slices"
+	"sync"
 	"testing"
 	"time"
 
+	"authz-service/internal/db"
+
+	"github.com/google/uuid"
 	"github.com/segmentio/kafka-go"
 )
 
@@ -81,21 +85,112 @@ func TestConsumer_CommitsHandledMessages(t *testing.T) {
 	}
 }
 
-func TestConsumer_NoCommitAfterAbort(t *testing.T) {
+// blockingStore wraps fakeStore so ApplyEvent blocks, like a slow transaction,
+// until release is closed or its ctx is done.
+type blockingStore struct {
+	*fakeStore
+	started chan struct{} // closed when the first ApplyEvent starts
+	release chan struct{}
+	once    sync.Once
+}
+
+func newBlockingStore(s *fakeStore) *blockingStore {
+	return &blockingStore{fakeStore: s, started: make(chan struct{}), release: make(chan struct{})}
+}
+
+func (s *blockingStore) ApplyEvent(ctx context.Context, eventID uuid.UUID, eventType string, fn func(db.Writer) error) (bool, error) {
+	s.once.Do(func() { close(s.started) })
+	select {
+	case <-s.release:
+		return s.fakeStore.ApplyEvent(ctx, eventID, eventType, fn)
+	case <-ctx.Done():
+		return false, ctx.Err()
+	}
+}
+
+// commitCtxReader records whether the ctx passed to each commit was already done.
+type commitCtxReader struct {
+	*fakeReader
+	commitCtxDone []bool
+}
+
+func (r *commitCtxReader) CommitMessages(ctx context.Context, msgs ...kafka.Message) error {
+	r.commitCtxDone = append(r.commitCtxDone, ctx.Err() != nil)
+	return r.fakeReader.CommitMessages(ctx, msgs...)
+}
+
+// AC-5: shutdown during an event lets it finish and commits it; nothing more is fetched.
+func TestConsumer_DrainsInFlightEventOnShutdown(t *testing.T) {
 	hs := newHarness(t)
 	hs.seedIDs()
+	bs := newBlockingStore(hs.store)
+	h := NewHandler(bs, hs.cache, hs.pub, "worker-1")
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	reader := &commitCtxReader{fakeReader: &fakeReader{msgs: []kafka.Message{revokeMsg(t, 7), revokeMsg(t, 8)}}}
+	c := newConsumer(reader, h)
 
-	// Shutdown arrives while the transaction runs.
-	hs.store.onApply = cancel
-	hs.store.applyErr = context.Canceled
+	done := make(chan error, 1)
+	go func() { done <- c.Run(ctx) }()
+	<-bs.started
+	cancel()                          // SIGTERM while the transaction runs
+	time.Sleep(20 * time.Millisecond) // the in-flight event must survive the cancel
+	close(bs.release)
 
+	var err error
+	select {
+	case err = <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run did not return after the in-flight event finished")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run = %v, want context.Canceled", err)
+	}
+	if len(reader.committed) != 1 || reader.committed[0].Offset != 7 {
+		t.Fatalf("committed = %+v, want the drained offset 7", reader.committed)
+	}
+	if reader.commitCtxDone[0] {
+		t.Fatal("the drained message was committed with an already-cancelled ctx")
+	}
+	if len(reader.msgs) != 1 {
+		t.Fatalf("Run must stop fetching after shutdown; %d messages left, want 1", len(reader.msgs))
+	}
+	if len(hs.pub.dlq) != 0 {
+		t.Fatal("a drained event must not be dead-lettered")
+	}
+	if len(hs.cache.invalidations) != 1 {
+		t.Fatalf("the drained event's follow-ups must run, invalidations = %v", hs.cache.invalidations)
+	}
+}
+
+// AC-5: past the drain deadline the in-flight event is aborted: no DLQ, no commit.
+func TestConsumer_NoCommitAfterDrainDeadline(t *testing.T) {
+	logs := captureLogs(t)
+	hs := newHarness(t)
+	hs.seedIDs()
+	bs := newBlockingStore(hs.store) // never released
+	h := NewHandler(bs, hs.cache, hs.pub, "worker-1")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	reader := &fakeReader{msgs: []kafka.Message{revokeMsg(t, 7), revokeMsg(t, 8)}}
-	c := newConsumer(reader, hs.h)
+	c := newConsumer(reader, h)
+	c.drainTimeout = 50 * time.Millisecond
 
-	err := c.Run(ctx)
+	done := make(chan error, 1)
+	go func() { done <- c.Run(ctx) }()
+	<-bs.started
+	start := time.Now()
+	cancel()
 
+	var err error
+	select {
+	case err = <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run did not return after the drain deadline")
+	}
+	if elapsed := time.Since(start); elapsed < 50*time.Millisecond {
+		t.Fatalf("aborted after %v, before the 50ms drain deadline", elapsed)
+	}
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("Run = %v, want context.Canceled", err)
 	}
@@ -105,8 +200,32 @@ func TestConsumer_NoCommitAfterAbort(t *testing.T) {
 	if len(reader.msgs) != 1 {
 		t.Fatalf("Run must stop after an abort; %d messages left, want 1", len(reader.msgs))
 	}
-	if len(hs.pub.dlq) != 0 {
+	if len(hs.pub.dlqTries) != 0 {
 		t.Fatal("aborted message must not be dead-lettered")
+	}
+	if got := recordsAt(logs(), "WARN", "drain deadline passed"); len(got) != 1 || got[0]["event_id"] != testEventID.String() {
+		t.Fatalf("drain deadline WARN = %v, want one with the event's event_id", got)
+	}
+}
+
+func TestConsumer_NoFetchAfterShutdown(t *testing.T) {
+	hs := newHarness(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	reader := &fakeReader{msgs: []kafka.Message{revokeMsg(t, 1)}}
+	c := newConsumer(reader, hs.h)
+
+	if err := c.Run(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run = %v, want context.Canceled", err)
+	}
+	if len(reader.msgs) != 1 || len(reader.committed) != 0 {
+		t.Fatalf("a stopped consumer fetched or committed: left %d, committed %v", len(reader.msgs), reader.committed)
+	}
+}
+
+func TestNewConsumer_DefaultDrainTimeout(t *testing.T) {
+	if c := newConsumer(&fakeReader{}, nil); c.drainTimeout != 10*time.Second || DrainTimeout != 10*time.Second {
+		t.Fatalf("drain timeout = %v (DrainTimeout %v), want 10s", c.drainTimeout, DrainTimeout)
 	}
 }
 

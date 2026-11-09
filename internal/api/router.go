@@ -1,6 +1,7 @@
 package api
 
 import (
+	"crypto/sha256"
 	"crypto/subtle"
 	"net/http"
 
@@ -65,7 +66,11 @@ func adminRouter(h *AdminHandler, token string) http.Handler {
 	return r
 }
 
+// adminAuthMiddleware requires X-Admin-Token to equal token. It compares
+// SHA-256 digests in constant time, so the comparison's timing reveals
+// neither the token's content nor its length.
 func adminAuthMiddleware(token string) func(http.Handler) http.Handler {
+	want := sha256.Sum256([]byte(token))
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			t := r.Header.Get("X-Admin-Token")
@@ -73,7 +78,8 @@ func adminAuthMiddleware(token string) func(http.Handler) http.Handler {
 				writeError(w, http.StatusUnauthorized, "missing_token", "X-Admin-Token header is required")
 				return
 			}
-			if subtle.ConstantTimeCompare([]byte(t), []byte(token)) != 1 {
+			got := sha256.Sum256([]byte(t))
+			if subtle.ConstantTimeCompare(got[:], want[:]) != 1 {
 				writeError(w, http.StatusForbidden, "invalid_token", "invalid admin token")
 				return
 			}

@@ -46,6 +46,10 @@ const TopicPartitions = 3
 // startTimeout bounds one container start.
 const startTimeout = 3 * time.Minute
 
+// AcquireTimeout is the pool acquire bound integration tests pass to
+// db.NewQueries: the service default (DB_ACQUIRE_TIMEOUT_SECS=2).
+const AcquireTimeout = 2 * time.Second
+
 // --- Postgres ---
 
 // StartPostgres starts Postgres, applies migrations/*.up.sql in lexical order,

@@ -37,6 +37,7 @@ func handlePermissions(res *resolver.Resolver) http.HandlerFunc {
 			writeError(w, http.StatusBadRequest, "invalid_request", "user_id must be a valid UUID")
 			return
 		}
+		r = withUserID(r, userID)
 
 		resourceType := r.URL.Query().Get("resource_type")
 		resourceID := r.URL.Query().Get("resource_id")

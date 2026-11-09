@@ -3,10 +3,12 @@ package resolver
 import (
 	"cmp"
 	"context"
+	"errors"
 	"fmt"
 	"slices"
 	"time"
 
+	"authz-service/internal/metrics"
 	"authz-service/internal/model"
 	"authz-service/internal/registry"
 
@@ -28,6 +30,7 @@ type store interface {
 	CheckOverride(ctx context.Context, userID uuid.UUID, permissionID int16, resourceID string) (*model.Effect, *time.Time, error)
 	CheckRole(ctx context.Context, userID uuid.UUID, permissionID int16, resourceType, resourceID string) (string, *time.Time, error)
 	Resources(ctx context.Context, userID uuid.UUID, permissionID int16, resourceType string, scopeFilter map[string]string) ([]string, error)
+	FilterResources(ctx context.Context, userID uuid.UUID, permissionID int16, resourceType string, candidates []string) ([]string, error)
 	UserRoleGrants(ctx context.Context, userID uuid.UUID, resourceType, resourceID string) ([]model.RoleGrant, error)
 	UserOverrides(ctx context.Context, userID uuid.UUID, resourceType, resourceID string) ([]model.OverrideGrant, error)
 }
@@ -47,53 +50,85 @@ func NewResolver(c checkCache, s store, reg *registry.Registry, cacheTTL time.Du
 
 // Check evaluates a single permission request.
 // Returns ErrUnknownPermission if (action, resource_type) is not in the registry.
+//
+// Each decision is counted in authz_check_total and timed in
+// authz_check_duration_seconds by its source category; failed checks (DB
+// errors) are not.
 func (r *Resolver) Check(ctx context.Context, req model.CheckRequest) (model.CheckResult, error) {
+	start := time.Now()
+	result, source, err := r.check(ctx, req)
+	switch {
+	case errors.Is(err, model.ErrUnknownPermission):
+		observeCheck(start, metrics.ResultUnknown, metrics.SourceUnknownPermission)
+	case err == nil:
+		observeCheck(start, checkResultLabel(result), source)
+	}
+	return result, err
+}
+
+func observeCheck(start time.Time, result, source string) {
+	metrics.CheckTotal.WithLabelValues(result, source).Inc()
+	metrics.CheckDuration.WithLabelValues(source).Observe(time.Since(start).Seconds())
+}
+
+func checkResultLabel(res model.CheckResult) string {
+	if res.Allowed {
+		return metrics.ResultAllowed
+	}
+	return metrics.ResultDenied
+}
+
+// check is Check without the metrics. It also returns the decision's source
+// category for the metric labels.
+func (r *Resolver) check(ctx context.Context, req model.CheckRequest) (model.CheckResult, string, error) {
 	// Step 0: registry resolve
 	permID, ok := r.registry.ResolvePermission(req.Action, req.ResourceType)
 	if !ok {
-		return model.CheckResult{}, model.ErrUnknownPermission
+		return model.CheckResult{}, "", model.ErrUnknownPermission
 	}
 
-	// Step 1: cache lookup
+	// Step 1: cache lookup. A cache error counts as a miss.
 	if hit, err := r.cache.Get(ctx, req); err == nil && hit != nil {
-		return *hit, nil
+		metrics.CacheHitTotal.Inc()
+		return *hit, metrics.SourceCache, nil
 	}
+	metrics.CacheMissTotal.Inc()
 
 	var result model.CheckResult
 
 	// Step 2 & 3: override check
 	effect, overrideExpires, err := r.db.CheckOverride(ctx, req.UserID, permID, req.ResourceID)
 	if err != nil {
-		return model.CheckResult{}, err
+		return model.CheckResult{}, "", err
 	}
 	if effect != nil {
 		switch *effect {
 		case model.EffectDeny:
 			result = model.CheckResult{Allowed: false, Source: "deny_override"}
 			r.cacheResult(ctx, req, result, r.ttlUntil(overrideExpires))
-			return result, nil
+			return result, metrics.SourceDenyOverride, nil
 		case model.EffectAllow:
 			result = model.CheckResult{Allowed: true, Source: "allow_override"}
 			r.cacheResult(ctx, req, result, r.ttlUntil(overrideExpires))
-			return result, nil
+			return result, metrics.SourceAllowOverride, nil
 		}
 	}
 
 	// Step 4: role expansion
 	roleName, roleExpires, err := r.db.CheckRole(ctx, req.UserID, permID, req.ResourceType, req.ResourceID)
 	if err != nil {
-		return model.CheckResult{}, err
+		return model.CheckResult{}, "", err
 	}
 	if roleName != "" {
 		result = model.CheckResult{Allowed: true, Source: "role:" + roleName}
 		r.cacheResult(ctx, req, result, r.ttlUntil(roleExpires))
-		return result, nil
+		return result, metrics.SourceRole, nil
 	}
 
 	// Step 5: default deny (no grant decides it, so the TTL is not capped)
 	result = model.CheckResult{Allowed: false, Source: "default_deny"}
 	r.cacheResult(ctx, req, result, r.cacheTTL)
-	return result, nil
+	return result, metrics.SourceDefaultDeny, nil
 }
 
 // ttlUntil caps the cache TTL at the remaining lifetime of the deciding grant;
@@ -128,7 +163,8 @@ func (r *Resolver) cacheResult(ctx context.Context, req model.CheckRequest, resu
 //  3. otherwise a role grant yields source "role:<name>", the lexicographically
 //     smallest role name winning when several roles grant the key.
 //
-// The result is sorted by resource_type, resource_id, action, and is never nil.
+// The result is sorted by resource_type, resource_id, action, and is never
+// nil; an entry's scope is never nil either ({} when the grant has none).
 func (r *Resolver) List(ctx context.Context, userID uuid.UUID, resourceType, resourceID string) ([]model.PermissionEntry, error) {
 	grants, err := r.db.UserRoleGrants(ctx, userID, resourceType, resourceID)
 	if err != nil {
@@ -189,6 +225,10 @@ func mergePermissions(grants []model.RoleGrant, overrides []model.OverrideGrant)
 		if _, ok := denied[k]; ok {
 			continue
 		}
+		// An unscoped grant serializes as "scope": {}, not null.
+		if e.Scope == nil {
+			e.Scope = map[string]string{}
+		}
 		entries = append(entries, e)
 	}
 	slices.SortFunc(entries, func(a, b model.PermissionEntry) int {
@@ -219,33 +259,31 @@ func (r *Resolver) Resources(ctx context.Context, req model.ResourcesRequest) (m
 }
 
 // Filter narrows a candidate list to the subset the user has the action on.
+// The database checks only the candidates (db.FilterResources), and the
+// result keeps the candidates' order (duplicates included). It is never nil.
 func (r *Resolver) Filter(ctx context.Context, userID uuid.UUID, action, resourceType string, candidateIDs []string) ([]string, error) {
 	permID, ok := r.registry.ResolvePermission(action, resourceType)
 	if !ok {
 		return nil, model.ErrUnknownPermission
 	}
+	if len(candidateIDs) == 0 {
+		return []string{}, nil
+	}
 
-	// Get all resource IDs the user has access to
-	allIDs, err := r.db.Resources(ctx, userID, permID, resourceType, nil)
+	allowedIDs, err := r.db.FilterResources(ctx, userID, permID, resourceType, candidateIDs)
 	if err != nil {
 		return nil, err
 	}
-
-	// Build a set for O(1) lookups
-	allowed := make(map[string]struct{}, len(allIDs))
-	for _, id := range allIDs {
+	allowed := make(map[string]struct{}, len(allowedIDs))
+	for _, id := range allowedIDs {
 		allowed[id] = struct{}{}
 	}
 
-	// Filter candidates
-	var result []string
+	result := make([]string, 0, len(allowedIDs))
 	for _, id := range candidateIDs {
 		if _, ok := allowed[id]; ok {
 			result = append(result, id)
 		}
-	}
-	if result == nil {
-		result = []string{}
 	}
 	return result, nil
 }

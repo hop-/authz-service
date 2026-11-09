@@ -25,6 +25,10 @@ type Config struct {
 	// Registry config (api): how often the registry is reloaded from the DB
 	RegistryReloadSecs int `goconfig:"application.registry.reloadSecs"`
 
+	// event_log retention (worker): rows processed more than this many hours
+	// ago are deleted; 0 disables the cleanup
+	EventLogRetentionHours int `goconfig:"application.eventLog.retentionHours"`
+
 	// Admin mode config
 	AdminMode  bool   `goconfig:"application.admin.enable"`
 	AdminToken string `goconfig:"application.admin.token,optional"`

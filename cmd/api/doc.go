@@ -4,7 +4,6 @@
 //	@version		1.0
 //	@description	Authorization microservice with RBAC, resource-scoped roles, and user permission overrides.
 //
-//	@host		localhost:8080
 //	@BasePath	/
 //
 //	@securityDefinitions.apikey	AdminToken

@@ -96,10 +96,16 @@ func (fakeCheckCache) Set(context.Context, model.CheckRequest, model.CheckResult
 
 type fakeResolverStore struct {
 	roleName    string
-	resourceIDs []string
+	resourceIDs []string // returned by Resources and FilterResources
 	grants      []model.RoleGrant
 	overrides   []model.OverrideGrant
 	err         error
+
+	// listFilters records the (resource_type, resource_id) of each
+	// UserRoleGrants and UserOverrides call.
+	listFilters [][2]string
+	// filterCandidates records the candidates of each FilterResources call.
+	filterCandidates [][]string
 }
 
 func (s *fakeResolverStore) CheckOverride(context.Context, uuid.UUID, int16, string) (*model.Effect, *time.Time, error) {
@@ -114,11 +120,18 @@ func (s *fakeResolverStore) Resources(context.Context, uuid.UUID, int16, string,
 	return s.resourceIDs, s.err
 }
 
-func (s *fakeResolverStore) UserRoleGrants(context.Context, uuid.UUID, string, string) ([]model.RoleGrant, error) {
+func (s *fakeResolverStore) FilterResources(_ context.Context, _ uuid.UUID, _ int16, _ string, candidates []string) ([]string, error) {
+	s.filterCandidates = append(s.filterCandidates, candidates)
+	return s.resourceIDs, s.err
+}
+
+func (s *fakeResolverStore) UserRoleGrants(_ context.Context, _ uuid.UUID, resourceType, resourceID string) ([]model.RoleGrant, error) {
+	s.listFilters = append(s.listFilters, [2]string{resourceType, resourceID})
 	return s.grants, s.err
 }
 
-func (s *fakeResolverStore) UserOverrides(context.Context, uuid.UUID, string, string) ([]model.OverrideGrant, error) {
+func (s *fakeResolverStore) UserOverrides(_ context.Context, _ uuid.UUID, resourceType, resourceID string) ([]model.OverrideGrant, error) {
+	s.listFilters = append(s.listFilters, [2]string{resourceType, resourceID})
 	return s.overrides, s.err
 }
 

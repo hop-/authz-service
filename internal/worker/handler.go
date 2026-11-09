@@ -9,6 +9,8 @@ import (
 	"time"
 
 	"authz-service/internal/db"
+	"authz-service/internal/logctx"
+	"authz-service/internal/metrics"
 	"authz-service/internal/model"
 	"authz-service/internal/producer"
 
@@ -35,6 +37,28 @@ type EventEnvelope struct {
 	Event      string    `json:"event"`
 	EventID    string    `json:"event_id"`
 	OccurredAt time.Time `json:"occurred_at"`
+	// UserID is set on per-user events only. It is decoded for log
+	// correlation; each event's own payload struct is what gets applied.
+	UserID string `json:"user_id,omitempty"`
+}
+
+// eventLogger returns ctx's logger with the event's correlation fields:
+// event_id and event_type, plus user_id for per-user events.
+func eventLogger(ctx context.Context, env EventEnvelope) *slog.Logger {
+	args := []any{"event_id", env.EventID, "event_type", env.Event}
+	if env.UserID != "" {
+		args = append(args, "user_id", env.UserID)
+	}
+	return logctx.FromContext(ctx).With(args...)
+}
+
+// messageLogger is eventLogger for a raw message. A message whose envelope
+// doesn't decode gets empty event fields; Handle dead-letters it.
+func messageLogger(ctx context.Context, msg kafka.Message) *slog.Logger {
+	var env EventEnvelope
+	// The decode error is Handle's to report; here it only leaves fields empty.
+	_ = json.Unmarshal(msg.Value, &env)
+	return eventLogger(ctx, env)
 }
 
 // store is the worker's view of the primary database. The worker keeps no
@@ -134,26 +158,41 @@ func isPermanent(err error) bool {
 // processing was aborted because ctx was cancelled; the caller must then not
 // commit the offset.
 func (h *Handler) Handle(ctx context.Context, msg kafka.Message) error {
+	start := time.Now()
+	env, status, err := h.process(ctx, msg)
+	if err != nil {
+		return err // aborted: not counted
+	}
+	eventType := metrics.EventTypeLabel(env.Event)
+	metrics.WorkerEventsProcessedTotal.WithLabelValues(eventType, status).Inc()
+	metrics.WorkerProcessingDuration.WithLabelValues(eventType).Observe(time.Since(start).Seconds())
+	return nil
+}
+
+// process is Handle without the metrics. On a nil error it also returns the
+// decoded envelope and the outcome: StatusOK, StatusDuplicate or StatusDLQ.
+func (h *Handler) process(ctx context.Context, msg kafka.Message) (EventEnvelope, string, error) {
 	var env EventEnvelope
-	if err := json.Unmarshal(msg.Value, &env); err != nil {
-		return h.deadLetter(ctx, msg, env, model.DLQReasonPermanent, fmt.Errorf("decode envelope: %w", err), 0)
+	envErr := json.Unmarshal(msg.Value, &env)
+	// Every log entry about this event goes through its logger.
+	ctx = logctx.WithContext(ctx, eventLogger(ctx, env))
+	if envErr != nil {
+		return env, metrics.StatusDLQ, h.deadLetter(ctx, msg, env, model.DLQReasonPermanent, fmt.Errorf("decode envelope: %w", envErr), 0)
 	}
 
 	eventID, err := uuid.Parse(env.EventID)
 	if err != nil {
-		return h.deadLetter(ctx, msg, env, model.DLQReasonPermanent, fmt.Errorf("invalid event_id %q: %w", env.EventID, err), 0)
+		return env, metrics.StatusDLQ, h.deadLetter(ctx, msg, env, model.DLQReasonPermanent, fmt.Errorf("invalid event_id %q: %w", env.EventID, err), 0)
 	}
 
-	slog.Info("processing event",
-		"event_type", env.Event,
-		"event_id", env.EventID,
-	)
+	logctx.FromContext(ctx).Info("processing event")
 
 	plan, err := h.prepare(env, msg.Value)
 	if err != nil {
-		return h.deadLetter(ctx, msg, env, model.DLQReasonPermanent, err, 0)
+		return env, metrics.StatusDLQ, h.deadLetter(ctx, msg, env, model.DLQReasonPermanent, err, 0)
 	}
 
+	status := metrics.StatusOK
 	applied := false
 	if plan.apply != nil {
 		retries, err := h.retry(ctx, env, func(ctx context.Context) error {
@@ -164,10 +203,11 @@ func (h *Handler) Handle(ctx context.Context, msg kafka.Message) error {
 			return err
 		})
 		if err != nil {
-			return h.fail(ctx, msg, env, err, retries)
+			return env, metrics.StatusDLQ, h.fail(ctx, msg, env, err, retries)
 		}
 		if !applied {
-			slog.Info("duplicate event, running follow-ups only", "event_id", env.EventID, "event_type", env.Event)
+			status = metrics.StatusDuplicate
+			logctx.FromContext(ctx).Info("duplicate event, running follow-ups only")
 		}
 	}
 
@@ -176,11 +216,11 @@ func (h *Handler) Handle(ctx context.Context, msg kafka.Message) error {
 			return plan.after(ctx, applied)
 		})
 		if err != nil {
-			return h.fail(ctx, msg, env, err, retries)
+			return env, metrics.StatusDLQ, h.fail(ctx, msg, env, err, retries)
 		}
 	}
 
-	return nil
+	return env, status, nil
 }
 
 // retry runs op until it succeeds, fails permanently, ctx is done, or
@@ -196,9 +236,7 @@ func (h *Handler) retry(ctx context.Context, env EventEnvelope, op func(ctx cont
 			return attempt, err
 		}
 
-		slog.Warn("transient error, retrying",
-			"event_id", env.EventID,
-			"event_type", env.Event,
+		logctx.FromContext(ctx).Warn("transient error, retrying",
 			"attempt", attempt+1,
 			"error", err,
 		)
@@ -224,9 +262,7 @@ func (h *Handler) fail(ctx context.Context, msg kafka.Message, env EventEnvelope
 // redelivered; otherwise it publishes the DLQ message.
 func (h *Handler) deadLetter(ctx context.Context, msg kafka.Message, env EventEnvelope, reason model.DLQReason, err error, retries int) error {
 	if ctxErr := ctx.Err(); ctxErr != nil {
-		slog.Warn("event processing aborted",
-			"event_id", env.EventID,
-			"event_type", env.Event,
+		logctx.FromContext(ctx).Warn("event processing aborted",
 			"error", err,
 		)
 		return ctxErr
@@ -259,48 +295,48 @@ func (h *Handler) sendToDLQ(ctx context.Context, msg kafka.Message, env EventEnv
 		OriginalPayload:    msg.Value,
 	}
 
+	log := logctx.FromContext(ctx)
 	delay := dlqInitialBackoff
 	for attempt := 1; ; attempt++ {
 		err := h.producer.PublishDLQ(ctx, env.EventID, dlqMsg)
 		if err == nil {
 			break
 		}
+		// One entry per failed attempt. The first is an ERROR with the full
+		// message, so it survives even if the process dies before the DLQ is
+		// back; later attempts log a WARN.
 		if attempt == 1 {
-			// Log the full message once, so it survives even if the process dies
-			// before the DLQ is back.
 			dlqJSON, jsonErr := json.Marshal(dlqMsg)
 			if jsonErr != nil {
 				dlqJSON = []byte(fmt.Sprintf("<marshal failed: %v>", jsonErr))
 			}
-			slog.Error("failed to publish to DLQ, retrying until it succeeds",
-				"event_id", env.EventID,
+			log.Error("failed to publish to DLQ, retrying until it succeeds",
+				"attempt", attempt,
+				"backoff", delay,
 				"error", err,
 				"dlq_message", string(dlqJSON),
 			)
+		} else {
+			log.Warn("DLQ publish failed, retrying",
+				"attempt", attempt,
+				"backoff", delay,
+				"error", err,
+			)
 		}
 		if ctxErr := ctx.Err(); ctxErr != nil {
-			slog.Warn("DLQ publish aborted, offset not committed",
-				"event_id", env.EventID,
+			log.Warn("DLQ publish aborted, offset not committed",
 				"attempt", attempt,
-				"error", err,
+				"error", ctxErr,
 			)
 			return ctxErr
 		}
-		slog.Warn("DLQ publish failed, retrying",
-			"event_id", env.EventID,
-			"attempt", attempt,
-			"backoff", delay,
-			"error", err,
-		)
 		if err := h.sleep(ctx, delay); err != nil {
 			return err
 		}
 		delay = min(delay*2, dlqMaxBackoff)
 	}
 
-	slog.Warn("message sent to DLQ",
-		"event_id", env.EventID,
-		"event_type", env.Event,
+	log.Warn("message sent to DLQ",
 		"dlq_reason", reason,
 		"retry_count", retryCount,
 		"original_error", originalErr.Error(),
@@ -556,7 +592,7 @@ func (h *Handler) prepareActionRegistered(payload []byte) (eventPlan, error) {
 					return fmt.Errorf("lookup permission (%s, %s): %w", evt.Action, evt.ResourceType, err)
 				}
 				if !found {
-					slog.Info("permission no longer exists, skipping follow-ups",
+					logctx.FromContext(ctx).Info("permission no longer exists, skipping follow-ups",
 						"action", evt.Action, "resource_type", evt.ResourceType)
 					return nil
 				}
@@ -620,7 +656,7 @@ func (h *Handler) prepareRoleCreated(payload []byte) (eventPlan, error) {
 					return fmt.Errorf("lookup role %s: %w", evt.RoleName, err)
 				}
 				if !found {
-					slog.Info("role no longer exists, skipping follow-ups", "role_name", evt.RoleName)
+					logctx.FromContext(ctx).Info("role no longer exists, skipping follow-ups", "role_name", evt.RoleName)
 					return nil
 				}
 			}

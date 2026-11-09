@@ -21,6 +21,9 @@
     "registry": {
       "reloadSecs": 300
     },
+    "eventLog": {
+      "retentionHours": 24
+    },
     "admin": {
       "enable": false
     }

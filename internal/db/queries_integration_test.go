@@ -40,7 +40,7 @@ func TestMain(m *testing.M) {
 
 var actor = uuid.MustParse("00000000-0000-0000-0000-0000000000bb")
 
-func queries() *db.Queries { return db.NewQueries(pool) }
+func queries() *db.Queries { return db.NewQueries(pool, testinfra.AcquireTimeout) }
 
 // apply runs fn in ApplyEvent with a fresh event id and requires it to apply.
 func apply(t *testing.T, q *db.Queries, fn func(w db.Writer) error) {

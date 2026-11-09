@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"authz-service/internal/kafkatopics"
+	"authz-service/internal/metrics"
 
 	"github.com/segmentio/kafka-go"
 )
@@ -18,6 +19,9 @@ const (
 	syncInitialBackoff = 100 * time.Millisecond
 	syncMaxBackoff     = 5 * time.Second
 	syncStartMaxDelay  = 30 * time.Second
+	// reloadTimeout bounds each periodic reload. The reload holds applyMu,
+	// so a hung DB query would otherwise stall event application.
+	reloadTimeout = 30 * time.Second
 )
 
 // Syncer keeps one API pod's registry in sync with the event topic, without a
@@ -39,6 +43,8 @@ type Syncer struct {
 	reg         *Registry
 	loader      Loader
 	reloadEvery time.Duration
+	// reloadTimeout bounds each periodic reload. Tests shorten it.
+	reloadTimeout time.Duration
 
 	// applyMu serializes event application with the periodic reload. Without
 	// it, an event applied while a reload is in flight would be overwritten by
@@ -55,11 +61,12 @@ type Syncer struct {
 // reload.
 func NewSyncer(brokers []string, topic string, reg *Registry, l Loader, reloadEvery time.Duration) *Syncer {
 	return &Syncer{
-		brokers:     brokers,
-		topic:       topic,
-		reg:         reg,
-		loader:      l,
-		reloadEvery: reloadEvery,
+		brokers:       brokers,
+		topic:         topic,
+		reg:           reg,
+		loader:        l,
+		reloadEvery:   reloadEvery,
+		reloadTimeout: reloadTimeout,
 	}
 }
 
@@ -120,6 +127,7 @@ func (s *Syncer) captureAndLoad(ctx context.Context) (map[int]int64, error) {
 			err = s.reg.Reload(ctx, s.loader)
 		}
 		if err == nil {
+			metrics.RegistryUpdatesTotal.WithLabelValues(metrics.EventTypeReload).Inc()
 			slog.Info("registry sync: snapshot loaded, consuming from captured offsets",
 				"topic", s.topic, "offsets", offsets,
 				"permissions", s.reg.PermissionCount(), "roles", s.reg.RoleCount())
@@ -211,7 +219,8 @@ func (s *Syncer) consume(ctx context.Context, partition int, reader *kafka.Reade
 }
 
 // reloadLoop reloads the registry from the DB every reloadEvery until ctx is
-// done. Errors are logged and never stop the loop.
+// done. Each reload is bounded by reloadTimeout. Errors are logged and never
+// stop the loop.
 func (s *Syncer) reloadLoop(ctx context.Context) {
 	ticker := time.NewTicker(s.reloadEvery)
 	defer ticker.Stop()
@@ -220,9 +229,7 @@ func (s *Syncer) reloadLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			s.applyMu.Lock()
-			err := s.reg.Reload(ctx, s.loader)
-			s.applyMu.Unlock()
+			err := s.reloadBounded(ctx)
 			if err != nil {
 				if ctx.Err() != nil {
 					return
@@ -230,10 +237,24 @@ func (s *Syncer) reloadLoop(ctx context.Context) {
 				slog.Error("registry sync: periodic reload failed", "error", err)
 				continue
 			}
+			metrics.RegistryUpdatesTotal.WithLabelValues(metrics.EventTypeReload).Inc()
 			slog.Info("registry sync: periodic reload",
 				"permissions", s.reg.PermissionCount(), "roles", s.reg.RoleCount())
 		}
 	}
+}
+
+// reloadBounded reloads the registry under applyMu, bounded by
+// reloadTimeout (no bound when it is 0).
+func (s *Syncer) reloadBounded(ctx context.Context) error {
+	s.applyMu.Lock()
+	defer s.applyMu.Unlock()
+	if s.reloadTimeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, s.reloadTimeout)
+		defer cancel()
+	}
+	return s.reg.Reload(ctx, s.loader)
 }
 
 // applyEvent applies one registry event to reg. Other events are ignored after
@@ -259,6 +280,7 @@ func applyEvent(reg *Registry, value []byte) {
 			return
 		}
 		reg.AddPermission(evt.Action, evt.ResourceType, evt.ID)
+		metrics.RegistryUpdatesTotal.WithLabelValues(env.Event).Inc()
 		slog.Info("registry: added permission", "action", evt.Action, "resource_type", evt.ResourceType)
 	case "action.removed":
 		var evt struct {
@@ -269,6 +291,7 @@ func applyEvent(reg *Registry, value []byte) {
 			return
 		}
 		reg.RemovePermission(evt.Action, evt.ResourceType)
+		metrics.RegistryUpdatesTotal.WithLabelValues(env.Event).Inc()
 		slog.Info("registry: removed permission", "action", evt.Action, "resource_type", evt.ResourceType)
 	case "role.id.assigned":
 		var evt struct {
@@ -279,6 +302,7 @@ func applyEvent(reg *Registry, value []byte) {
 			return
 		}
 		reg.AddRole(evt.RoleName, evt.ID)
+		metrics.RegistryUpdatesTotal.WithLabelValues(env.Event).Inc()
 		slog.Info("registry: added role", "role_name", evt.RoleName)
 	case "role.removed":
 		var evt struct {
@@ -288,6 +312,7 @@ func applyEvent(reg *Registry, value []byte) {
 			return
 		}
 		reg.RemoveRole(evt.RoleName)
+		metrics.RegistryUpdatesTotal.WithLabelValues(env.Event).Inc()
 		slog.Info("registry: removed role", "role_name", evt.RoleName)
 	default:
 		// action.registered and role.created carry no id: wait for *.id.assigned.

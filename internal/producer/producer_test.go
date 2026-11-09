@@ -2,6 +2,7 @@ package producer
 
 import (
 	"context"
+	"fmt"
 	"net"
 	"strings"
 	"testing"
@@ -34,18 +35,17 @@ func listen(t *testing.T) string {
 	return ln.Addr().String()
 }
 
-// unreachable returns an address with nothing listening on it.
-func unreachable(t *testing.T) string {
-	t.Helper()
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("listen: %v", err)
-	}
-	addr := ln.Addr().String()
-	if err := ln.Close(); err != nil {
-		t.Fatalf("close: %v", err)
-	}
-	return addr
+// nonRoutable returns a TEST-NET-1 address (RFC 5737, 192.0.2.0/24): never
+// assigned, so a dial gets no answer and fails only at its deadline. Unlike a
+// released local port, no other process can take it (007 F-008).
+func nonRoutable(n int) string {
+	return fmt.Sprintf("192.0.2.%d:9", n)
+}
+
+// refused returns an address whose dial fails at once: nothing can listen on
+// port 0, so the kernel refuses the connection.
+func refused() string {
+	return "127.0.0.1:0"
 }
 
 func TestNewProducer_KeepsBrokerList(t *testing.T) {
@@ -60,8 +60,10 @@ func TestPing(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
+	// Ping dials brokers in order on one ctx, so the first broker must fail
+	// fast here; a non-routable one would use up the whole deadline.
 	t.Run("first unreachable, second reachable", func(t *testing.T) {
-		bad := unreachable(t)
+		bad := refused()
 		good := listen(t)
 		p := NewProducer(bad+","+good, "topic")
 		defer p.Close()
@@ -81,12 +83,18 @@ func TestPing(t *testing.T) {
 	})
 
 	t.Run("all unreachable", func(t *testing.T) {
-		bad1 := unreachable(t)
-		bad2 := unreachable(t)
+		bad1 := nonRoutable(1)
+		bad2 := nonRoutable(2)
 		p := NewProducer(bad1+","+bad2, "topic")
 		defer p.Close()
+		short, cancelShort := context.WithTimeout(context.Background(), 300*time.Millisecond)
+		defer cancelShort()
 
-		err := p.Ping(ctx)
+		start := time.Now()
+		err := p.Ping(short)
+		if elapsed := time.Since(start); elapsed > 5*time.Second {
+			t.Errorf("Ping took %v, want it bounded by the 300ms deadline", elapsed)
+		}
 		if err == nil {
 			t.Fatal("Ping = nil, want error when no broker is reachable")
 		}

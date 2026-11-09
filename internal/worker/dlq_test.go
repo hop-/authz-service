@@ -96,8 +96,22 @@ func TestSendToDLQ_RetriesUntilPublished(t *testing.T) {
 	if logged.DLQEventID != first.DLQEventID || string(logged.OriginalPayload) != string(first.OriginalPayload) {
 		t.Errorf("logged DLQ message %+v does not match the published one", logged)
 	}
-	if warns := recordsAt(records, "WARN", "DLQ publish failed, retrying"); len(warns) != 2 {
-		t.Errorf("per-attempt WARN logs = %d, want 2", len(warns))
+	// 008 F-001: one entry per failed attempt. Attempt 1 is the ERROR above,
+	// with no duplicate WARN; attempt 2 is a WARN.
+	if errs[0]["attempt"] != float64(1) {
+		t.Errorf("ERROR attempt = %v, want 1", errs[0]["attempt"])
+	}
+	warns := recordsAt(records, "WARN", "DLQ publish failed, retrying")
+	if len(warns) != 1 {
+		t.Fatalf("per-attempt WARN logs = %d, want 1 (attempt 2 only)", len(warns))
+	}
+	if warns[0]["attempt"] != float64(2) {
+		t.Errorf("WARN attempt = %v, want 2", warns[0]["attempt"])
+	}
+	for _, r := range append(errs, warns...) {
+		if r["event_id"] == nil || r["event_type"] == nil {
+			t.Errorf("DLQ log entry lacks event fields: %v", r)
+		}
 	}
 }
 
@@ -198,10 +212,14 @@ func TestConsumer_DLQOutageNotCommitted(t *testing.T) {
 		if len(hs.sleeps) == 5 {
 			cancel() // shutdown while the DLQ is still down
 		}
+		// The handler runs on the drain ctx, which outlives the cancel by the
+		// drain deadline; pause briefly so the retries don't spin.
+		time.Sleep(time.Millisecond)
 		return ctx.Err()
 	}
 	reader := &fakeReader{msgs: []kafka.Message{badEnvelope()}}
 	c := newConsumer(reader, hs.h)
+	c.drainTimeout = 50 * time.Millisecond
 
 	err := c.Run(ctx)
 

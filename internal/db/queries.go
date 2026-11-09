@@ -73,6 +73,27 @@ FROM user_permission_overrides upo
 WHERE upo.user_id = $1 AND upo.permission_id = $2 AND upo.effect = 'DENY'
   AND (upo.expires_at IS NULL OR upo.expires_at > NOW())`
 
+	// POST /query/v1/resources/filter: the resourcesQueryNoScope set,
+	// restricted to the candidate ids ($4) in every branch.
+	filterResourcesQuery = `SELECT upo.resource_id
+FROM user_permission_overrides upo
+WHERE upo.user_id = $1 AND upo.permission_id = $2 AND upo.effect = 'ALLOW'
+  AND upo.resource_id = ANY($4::text[])
+  AND (upo.expires_at IS NULL OR upo.expires_at > NOW())
+UNION
+SELECT ur.resource_id
+FROM user_roles ur
+JOIN role_permissions rp ON rp.role_id = ur.role_id
+WHERE ur.user_id = $1 AND rp.permission_id = $2 AND ur.resource_type = $3
+  AND ur.resource_id = ANY($4::text[])
+  AND (ur.expires_at IS NULL OR ur.expires_at > NOW())
+EXCEPT
+SELECT upo.resource_id
+FROM user_permission_overrides upo
+WHERE upo.user_id = $1 AND upo.permission_id = $2 AND upo.effect = 'DENY'
+  AND upo.resource_id = ANY($4::text[])
+  AND (upo.expires_at IS NULL OR upo.expires_at > NOW())`
+
 	// GET /query/v1/permissions: raw role-grant rows. A role grants a permission
 	// only on assignments of the permission's own resource type.
 	listUserPermissionsQuery = `SELECT p.action, p.resource_type, ur.resource_id, ur.scope, r.name AS source
@@ -178,6 +199,13 @@ LIMIT 1`
 
 	deleteRolePermissionQuery = `DELETE FROM role_permissions WHERE role_id = $1 AND permission_id = $2`
 
+	// event_log retention cleanup (worker). One batch: at most $2 rows
+	// processed more than $1 ago.
+	tryAdvisoryLockQuery     = `SELECT pg_try_advisory_lock($1)`
+	advisoryUnlockQuery      = `SELECT pg_advisory_unlock($1)`
+	deleteExpiredEventsQuery = `DELETE FROM event_log WHERE ctid IN (
+  SELECT ctid FROM event_log WHERE processed_at < NOW() - $1::interval LIMIT $2)`
+
 	// Worker id lookups (primary DB), used by duplicate-path follow-ups
 	permissionIDQuery = `SELECT id FROM permissions WHERE action = $1 AND resource_type = $2`
 	roleIDQuery       = `SELECT id FROM roles WHERE name = $1`
@@ -186,10 +214,45 @@ LIMIT 1`
 // Queries wraps a pgxpool.Pool and provides typed query methods.
 type Queries struct {
 	pool *pgxpool.Pool
+	// acquireTimeout bounds each connection acquisition (0: no bound).
+	acquireTimeout time.Duration
 }
 
-func NewQueries(pool *pgxpool.Pool) *Queries {
-	return &Queries{pool: pool}
+// NewQueries returns Queries on pool. acquireTimeout bounds how long each
+// method waits for a pool connection (DB_ACQUIRE_TIMEOUT_SECS); 0 means it
+// waits as long as its ctx allows. pgxpool has no acquire-timeout option of
+// its own.
+func NewQueries(pool *pgxpool.Pool, acquireTimeout time.Duration) *Queries {
+	return &Queries{pool: pool, acquireTimeout: acquireTimeout}
+}
+
+// acquire gets a pool connection, waiting at most acquireTimeout. The
+// timeout covers the acquisition only: the caller runs its query on its own
+// ctx and must Release the connection after closing any rows.
+func (q *Queries) acquire(ctx context.Context) (*pgxpool.Conn, error) {
+	actx := ctx
+	if q.acquireTimeout > 0 {
+		var cancel context.CancelFunc
+		actx, cancel = context.WithTimeout(ctx, q.acquireTimeout)
+		defer cancel()
+	}
+	conn, err := q.pool.Acquire(actx)
+	if err != nil {
+		return nil, fmt.Errorf("acquire db connection: %w", err)
+	}
+	return conn, nil
+}
+
+// queryRow runs a single-row query on an acquired connection and scans it
+// into dest.
+func (q *Queries) queryRow(ctx context.Context, sql string, dest ...any) error {
+	conn, err := q.acquire(ctx)
+	if err != nil {
+		return err
+	}
+	defer conn.Release()
+
+	return conn.QueryRow(ctx, sql).Scan(dest...)
 }
 
 func (q *Queries) Pool() *pgxpool.Pool {
@@ -199,7 +262,13 @@ func (q *Queries) Pool() *pgxpool.Pool {
 // CheckOverride returns the active override effect for a user+permission+resource,
 // if any, and its expires_at (nil when it never expires). DENY wins over ALLOW.
 func (q *Queries) CheckOverride(ctx context.Context, userID uuid.UUID, permissionID int16, resourceID string) (*model.Effect, *time.Time, error) {
-	rows, err := q.pool.Query(ctx, checkOverrideQuery, userID, permissionID, resourceID)
+	conn, err := q.acquire(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer conn.Release()
+
+	rows, err := conn.Query(ctx, checkOverrideQuery, userID, permissionID, resourceID)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -239,9 +308,15 @@ func (q *Queries) CheckOverride(ctx context.Context, userID uuid.UUID, permissio
 // assignment, and that assignment's expires_at (nil when it never expires).
 // When several assignments match, the longest-lived one is returned.
 func (q *Queries) CheckRole(ctx context.Context, userID uuid.UUID, permissionID int16, resourceType, resourceID string) (string, *time.Time, error) {
+	conn, err := q.acquire(ctx)
+	if err != nil {
+		return "", nil, err
+	}
+	defer conn.Release()
+
 	var roleName string
 	var expiresAt *time.Time
-	err := q.pool.QueryRow(ctx, checkRoleQuery, userID, permissionID, resourceType, resourceID).Scan(&roleName, &expiresAt)
+	err = conn.QueryRow(ctx, checkRoleQuery, userID, permissionID, resourceType, resourceID).Scan(&roleName, &expiresAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return "", nil, nil
 	}
@@ -253,17 +328,22 @@ func (q *Queries) CheckRole(ctx context.Context, userID uuid.UUID, permissionID 
 
 // Resources returns resource IDs where a user has the given permission.
 func (q *Queries) Resources(ctx context.Context, userID uuid.UUID, permissionID int16, resourceType string, scopeFilter map[string]string) ([]string, error) {
+	conn, err := q.acquire(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Release()
+
 	var rows pgx.Rows
-	var err error
 
 	if scopeFilter == nil {
-		rows, err = q.pool.Query(ctx, resourcesQueryNoScope, userID, permissionID, resourceType)
+		rows, err = conn.Query(ctx, resourcesQueryNoScope, userID, permissionID, resourceType)
 	} else {
 		scopeJSON, jsonErr := json.Marshal(scopeFilter)
 		if jsonErr != nil {
 			return nil, jsonErr
 		}
-		rows, err = q.pool.Query(ctx, resourcesQueryWithScope, userID, permissionID, resourceType, scopeJSON)
+		rows, err = conn.Query(ctx, resourcesQueryWithScope, userID, permissionID, resourceType, scopeJSON)
 	}
 	if err != nil {
 		return nil, err
@@ -281,19 +361,55 @@ func (q *Queries) Resources(ctx context.Context, userID uuid.UUID, permissionID 
 	return ids, rows.Err()
 }
 
+// FilterResources returns the candidates on which the user has the given
+// permission: the same ALLOW override ∪ role grant − DENY override set as
+// Resources without a scope filter, restricted to candidates in SQL. The
+// result is unordered and has no duplicates.
+func (q *Queries) FilterResources(ctx context.Context, userID uuid.UUID, permissionID int16, resourceType string, candidates []string) ([]string, error) {
+	conn, err := q.acquire(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Release()
+
+	rows, err := conn.Query(ctx, filterResourcesQuery, userID, permissionID, resourceType, candidates)
+	if err != nil {
+		return nil, fmt.Errorf("query filter resources: %w", err)
+	}
+	defer rows.Close()
+
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("scan filter resource: %w", err)
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate filter resources: %w", err)
+	}
+	return ids, nil
+}
+
 // UserRoleGrants returns the user's active role-grant rows, optionally filtered
 // by resource type, or by resource type and id. Rows are raw: precedence
 // against overrides is applied by the resolver.
 func (q *Queries) UserRoleGrants(ctx context.Context, userID uuid.UUID, resourceType, resourceID string) ([]model.RoleGrant, error) {
+	conn, err := q.acquire(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Release()
+
 	var rows pgx.Rows
-	var err error
 	switch {
 	case resourceType != "" && resourceID != "":
-		rows, err = q.pool.Query(ctx, listUserPermissionsWithResourceQuery, userID, resourceType, resourceID)
+		rows, err = conn.Query(ctx, listUserPermissionsWithResourceQuery, userID, resourceType, resourceID)
 	case resourceType != "":
-		rows, err = q.pool.Query(ctx, listUserPermissionsWithTypeQuery, userID, resourceType)
+		rows, err = conn.Query(ctx, listUserPermissionsWithTypeQuery, userID, resourceType)
 	default:
-		rows, err = q.pool.Query(ctx, listUserPermissionsQuery, userID)
+		rows, err = conn.Query(ctx, listUserPermissionsQuery, userID)
 	}
 	if err != nil {
 		return nil, fmt.Errorf("query role grants: %w", err)
@@ -321,15 +437,20 @@ func (q *Queries) UserRoleGrants(ctx context.Context, userID uuid.UUID, resource
 // UserOverrides returns the user's active override rows (ALLOW and DENY),
 // optionally filtered by resource type, or by resource type and id.
 func (q *Queries) UserOverrides(ctx context.Context, userID uuid.UUID, resourceType, resourceID string) ([]model.OverrideGrant, error) {
+	conn, err := q.acquire(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Release()
+
 	var rows pgx.Rows
-	var err error
 	switch {
 	case resourceType != "" && resourceID != "":
-		rows, err = q.pool.Query(ctx, listUserOverridesWithResourceQuery, userID, resourceType, resourceID)
+		rows, err = conn.Query(ctx, listUserOverridesWithResourceQuery, userID, resourceType, resourceID)
 	case resourceType != "":
-		rows, err = q.pool.Query(ctx, listUserOverridesWithTypeQuery, userID, resourceType)
+		rows, err = conn.Query(ctx, listUserOverridesWithTypeQuery, userID, resourceType)
 	default:
-		rows, err = q.pool.Query(ctx, listUserOverridesQuery, userID)
+		rows, err = conn.Query(ctx, listUserOverridesQuery, userID)
 	}
 	if err != nil {
 		return nil, fmt.Errorf("query overrides: %w", err)
@@ -369,7 +490,13 @@ func decodeScope(b []byte) (map[string]string, error) {
 
 // LoadPermissions reads all permissions for the registry.
 func (q *Queries) LoadPermissions(ctx context.Context) (map[[2]string]int16, error) {
-	rows, err := q.pool.Query(ctx, loadPermissionsQuery)
+	conn, err := q.acquire(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Release()
+
+	rows, err := conn.Query(ctx, loadPermissionsQuery)
 	if err != nil {
 		return nil, err
 	}
@@ -389,7 +516,13 @@ func (q *Queries) LoadPermissions(ctx context.Context) (map[[2]string]int16, err
 
 // LoadRoles reads all roles for the registry.
 func (q *Queries) LoadRoles(ctx context.Context) (map[string]int16, error) {
-	rows, err := q.pool.Query(ctx, loadRolesQuery)
+	conn, err := q.acquire(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Release()
+
+	rows, err := conn.Query(ctx, loadRolesQuery)
 	if err != nil {
 		return nil, err
 	}
@@ -409,7 +542,13 @@ func (q *Queries) LoadRoles(ctx context.Context) (map[string]int16, error) {
 
 // ListAllPermissions returns all registered permissions (admin read).
 func (q *Queries) ListAllPermissions(ctx context.Context) ([]model.Permission, error) {
-	rows, err := q.pool.Query(ctx, listAllPermissionsQuery)
+	conn, err := q.acquire(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Release()
+
+	rows, err := conn.Query(ctx, listAllPermissionsQuery)
 	if err != nil {
 		return nil, err
 	}
@@ -428,7 +567,13 @@ func (q *Queries) ListAllPermissions(ctx context.Context) ([]model.Permission, e
 
 // ListAllRoles returns all roles (admin read).
 func (q *Queries) ListAllRoles(ctx context.Context) ([]model.Role, error) {
-	rows, err := q.pool.Query(ctx, listAllRolesQuery)
+	conn, err := q.acquire(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Release()
+
+	rows, err := conn.Query(ctx, listAllRolesQuery)
 	if err != nil {
 		return nil, err
 	}
@@ -447,7 +592,13 @@ func (q *Queries) ListAllRoles(ctx context.Context) ([]model.Role, error) {
 
 // ListRolePermissions returns permissions assigned to a role (admin read).
 func (q *Queries) ListRolePermissions(ctx context.Context, roleID int16) ([]model.Permission, error) {
-	rows, err := q.pool.Query(ctx, listRolePermissionsQuery, roleID)
+	conn, err := q.acquire(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Release()
+
+	rows, err := conn.Query(ctx, listRolePermissionsQuery, roleID)
 	if err != nil {
 		return nil, err
 	}
@@ -485,7 +636,10 @@ type Writer interface {
 	InsertRolePermission(ctx context.Context, roleID, permissionID int16) error
 	DeleteRolePermission(ctx context.Context, roleID, permissionID int16) error
 	// RoleID and PermissionID resolve natural keys in the same transaction as the
-	// writes, so a concurrent remove and re-create can't leave a stale id.
+	// writes, so no id is cached across events. Under READ COMMITTED each
+	// statement sees the latest committed rows, not one snapshot for the whole
+	// transaction: a concurrent remove makes a later write fail its foreign
+	// key check or affect no rows, rather than use a stale id.
 	// found is false (with a nil error) when the name doesn't exist.
 	RoleID(ctx context.Context, name string) (id int16, found bool, err error)
 	PermissionID(ctx context.Context, action, resourceType string) (id int16, found bool, err error)
@@ -496,7 +650,13 @@ type Writer interface {
 // returns (false, nil) without calling fn. Otherwise it runs fn, commits, and
 // returns (true, nil).
 func (q *Queries) ApplyEvent(ctx context.Context, eventID uuid.UUID, eventType string, fn func(Writer) error) (bool, error) {
-	tx, err := q.pool.Begin(ctx)
+	conn, err := q.acquire(ctx)
+	if err != nil {
+		return false, err
+	}
+	defer conn.Release()
+
+	tx, err := conn.Begin(ctx)
 	if err != nil {
 		return false, fmt.Errorf("begin tx: %w", err)
 	}
@@ -521,11 +681,89 @@ func (q *Queries) ApplyEvent(ctx context.Context, eventID uuid.UUID, eventType s
 	return true, nil
 }
 
+// EventLogDeleter deletes expired event_log rows on the connection that holds
+// the cleanup's advisory lock.
+type EventLogDeleter interface {
+	// DeleteExpiredEvents deletes up to limit rows processed more than
+	// retention ago and returns how many it deleted.
+	DeleteExpiredEvents(ctx context.Context, retention time.Duration, limit int) (int64, error)
+}
+
+// unlockTimeout bounds releasing an advisory lock. It is detached from the
+// caller's ctx, so a cancelled caller still unlocks.
+const unlockTimeout = 5 * time.Second
+
+// WithAdvisoryLock acquires a dedicated connection and tries the session
+// advisory lock key on it, without waiting. If another session holds the
+// lock it returns (false, nil) without calling fn. Otherwise it runs fn with
+// a deleter bound to that connection, then unlocks and releases the
+// connection, and returns (true, fn's error).
+//
+// If the unlock fails, the connection is closed rather than returned to the
+// pool, so the lock can't outlive the round on a pooled session.
+func (q *Queries) WithAdvisoryLock(ctx context.Context, key int64, fn func(EventLogDeleter) error) (locked bool, err error) {
+	conn, err := q.acquire(ctx)
+	if err != nil {
+		return false, err
+	}
+	if err := conn.QueryRow(ctx, tryAdvisoryLockQuery, key).Scan(&locked); err != nil {
+		conn.Release()
+		return false, fmt.Errorf("try advisory lock: %w", err)
+	}
+	if !locked {
+		conn.Release()
+		return false, nil
+	}
+	defer func() {
+		err = errors.Join(err, unlockAndRelease(ctx, conn, key))
+	}()
+	return true, fn(eventLogConn{conn: conn})
+}
+
+// unlockAndRelease releases the advisory lock key held by conn's session and
+// returns conn to the pool. If the unlock fails, it closes the connection,
+// which ends the session and its lock, before releasing it.
+func unlockAndRelease(ctx context.Context, conn *pgxpool.Conn, key int64) error {
+	defer conn.Release()
+	uctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), unlockTimeout)
+	defer cancel()
+
+	var unlocked bool
+	err := conn.QueryRow(uctx, advisoryUnlockQuery, key).Scan(&unlocked)
+	if err == nil && unlocked {
+		return nil
+	}
+	if err == nil {
+		err = errors.New("advisory lock was not held")
+	}
+	// A closed connection is destroyed by Release instead of being reused.
+	return errors.Join(fmt.Errorf("advisory unlock: %w", err), conn.Conn().Close(uctx))
+}
+
+// eventLogConn implements EventLogDeleter on the lock-holding connection.
+type eventLogConn struct {
+	conn *pgxpool.Conn
+}
+
+func (c eventLogConn) DeleteExpiredEvents(ctx context.Context, retention time.Duration, limit int) (int64, error) {
+	tag, err := c.conn.Exec(ctx, deleteExpiredEventsQuery, retention, limit)
+	if err != nil {
+		return 0, fmt.Errorf("delete expired event_log rows: %w", err)
+	}
+	return tag.RowsAffected(), nil
+}
+
 // PermissionID looks up a permission's surrogate id by natural key.
 // found is false (with a nil error) when no such permission exists.
 func (q *Queries) PermissionID(ctx context.Context, action, resourceType string) (int16, bool, error) {
+	conn, err := q.acquire(ctx)
+	if err != nil {
+		return 0, false, err
+	}
+	defer conn.Release()
+
 	var id int16
-	err := q.pool.QueryRow(ctx, permissionIDQuery, action, resourceType).Scan(&id)
+	err = conn.QueryRow(ctx, permissionIDQuery, action, resourceType).Scan(&id)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return 0, false, nil
 	}
@@ -538,8 +776,14 @@ func (q *Queries) PermissionID(ctx context.Context, action, resourceType string)
 // RoleID looks up a role's surrogate id by name.
 // found is false (with a nil error) when no such role exists.
 func (q *Queries) RoleID(ctx context.Context, name string) (int16, bool, error) {
+	conn, err := q.acquire(ctx)
+	if err != nil {
+		return 0, false, err
+	}
+	defer conn.Release()
+
 	var id int16
-	err := q.pool.QueryRow(ctx, roleIDQuery, name).Scan(&id)
+	err = conn.QueryRow(ctx, roleIDQuery, name).Scan(&id)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return 0, false, nil
 	}
@@ -660,6 +904,12 @@ func (w txWriter) PermissionID(ctx context.Context, action, resourceType string)
 
 // Ping checks database connectivity.
 func (q *Queries) Ping(ctx context.Context) error {
-	_, err := q.pool.Exec(ctx, "SELECT 1")
+	conn, err := q.acquire(ctx)
+	if err != nil {
+		return err
+	}
+	defer conn.Release()
+
+	_, err = conn.Exec(ctx, "SELECT 1")
 	return err
 }

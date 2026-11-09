@@ -43,9 +43,9 @@ func NewPool(ctx context.Context, cfg *config.Config, readOnly bool) (*pgxpool.P
 
 // CheckReplica verifies whether the connected database is a replica.
 // Logs a warning if it is not (connected to a primary).
-func CheckReplica(ctx context.Context, pool *pgxpool.Pool) {
+func (q *Queries) CheckReplica(ctx context.Context) {
 	var inRecovery bool
-	err := pool.QueryRow(ctx, "SELECT pg_is_in_recovery()").Scan(&inRecovery)
+	err := q.queryRow(ctx, "SELECT pg_is_in_recovery()", &inRecovery)
 	if err != nil {
 		slog.Warn("failed to check replica status", "error", err)
 		return
